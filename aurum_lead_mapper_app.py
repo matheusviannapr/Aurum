@@ -787,66 +787,6 @@ def ensure_neon_table(conn) -> None:
         )
     conn.commit()
 
-def save_leads_to_neon(
-    df_leads: pd.DataFrame | None = None,
-    connection_string: str | None = None,
-    usuario: str | None = None,
-    df: pd.DataFrame | None = None,
-) -> None:
-    df_final = df_leads if df_leads is not None else df
-    if df_final is None or df_final.empty:
-        return
-    if not connection_string:
-        raise ValueError("Connection string não informada.")
-    if not usuario:
-        raise ValueError("Usuário não informado para salvar no Neon.")
-    with psycopg2.connect(connection_string) as conn:
-        ensure_neon_table(conn)
-        with conn.cursor() as cur:
-            insert_sql = """
-                INSERT INTO aurum_leads (
-                    usuario, nome, telefone, site, email, endereco, categoria, fonte, rating, reviews,
-                    maps_url, latitude, longitude, area_telhado_m2, potencia_kwp, geracao_kwh,
-                    distancia_km, aurum_score, campanha, responsavel, estagio, obs, salvo_em
-                ) VALUES (
-                    %(usuario)s, %(nome)s, %(telefone)s, %(site)s, %(email)s, %(endereco)s, %(categoria)s,
-                    %(fonte)s, %(rating)s, %(reviews)s, %(maps_url)s, %(latitude)s,
-                    %(longitude)s, %(area_telhado_m2)s, %(potencia_kwp)s, %(geracao_kwh)s,
-                    %(distancia_km)s, %(aurum_score)s, %(campanha)s, %(responsavel)s,
-                    %(estagio)s, %(obs)s, %(salvo_em)s
-                );
-            """
-            records = []
-            for _, row in df_final.iterrows():
-                records.append(
-                    {
-                        "usuario": usuario,
-                        "nome": row.get("Nome"),
-                        "telefone": row.get("Telefone"),
-                        "site": row.get("Site"),
-                        "email": row.get("E-mail"),
-                        "endereco": row.get("Endereço"),
-                        "categoria": row.get("Categoria"),
-                        "fonte": row.get("Fonte"),
-                        "rating": row.get("Rating"),
-                        "reviews": row.get("Reviews"),
-                        "maps_url": row.get("Maps URL"),
-                        "latitude": row.get("Latitude"),
-                        "longitude": row.get("Longitude"),
-                        "area_telhado_m2": row.get("Área telhado (m²)"),
-                        "potencia_kwp": row.get("Potência estimada (kWp)"),
-                        "geracao_kwh": row.get("Geração anual (kWh)"),
-                        "distancia_km": row.get("Distância da base (km)"),
-                        "aurum_score": row.get("Aurum Score"),
-                        "campanha": row.get("Campanha"),
-                        "responsavel": row.get("Responsável"),
-                        "estagio": row.get("Estágio"),
-                        "obs": row.get("Obs"),
-                        "salvo_em": row.get("Salvo_em"),
-                    }
-                )
-            cur.executemany(insert_sql, records)
-        conn.commit()
 
 def load_leads_from_neon(usuario: str) -> pd.DataFrame:
     with psycopg2.connect(NEON_DB_URL) as conn:
@@ -996,60 +936,6 @@ def ensure_neon_table(conn) -> None:
         )
     conn.commit()
 
-def save_leads_to_neon(df_leads: pd.DataFrame, connection_string: str, usuario: str) -> None:
-    if df_leads.empty:
-        return
-    if not connection_string:
-        raise ValueError("Connection string não informada.")
-    if not usuario:
-        raise ValueError("Usuário não informado para salvar no Neon.")
-    with psycopg2.connect(connection_string) as conn:
-        ensure_neon_table(conn)
-        with conn.cursor() as cur:
-            insert_sql = """
-                INSERT INTO aurum_leads (
-                    usuario, nome, telefone, site, email, endereco, categoria, fonte, rating, reviews,
-                    maps_url, latitude, longitude, area_telhado_m2, potencia_kwp, geracao_kwh,
-                    distancia_km, aurum_score, campanha, responsavel, estagio, obs, salvo_em
-                ) VALUES (
-                    %(usuario)s, %(nome)s, %(telefone)s, %(site)s, %(email)s, %(endereco)s, %(categoria)s,
-                    %(fonte)s, %(rating)s, %(reviews)s, %(maps_url)s, %(latitude)s,
-                    %(longitude)s, %(area_telhado_m2)s, %(potencia_kwp)s, %(geracao_kwh)s,
-                    %(distancia_km)s, %(aurum_score)s, %(campanha)s, %(responsavel)s,
-                    %(estagio)s, %(obs)s, %(salvo_em)s
-                );
-            """
-            records = []
-            for _, row in df_leads.iterrows():
-                records.append(
-                    {
-                        "usuario": usuario,
-                        "nome": row.get("Nome"),
-                        "telefone": row.get("Telefone"),
-                        "site": row.get("Site"),
-                        "email": row.get("E-mail"),
-                        "endereco": row.get("Endereço"),
-                        "categoria": row.get("Categoria"),
-                        "fonte": row.get("Fonte"),
-                        "rating": row.get("Rating"),
-                        "reviews": row.get("Reviews"),
-                        "maps_url": row.get("Maps URL"),
-                        "latitude": row.get("Latitude"),
-                        "longitude": row.get("Longitude"),
-                        "area_telhado_m2": row.get("Área telhado (m²)"),
-                        "potencia_kwp": row.get("Potência estimada (kWp)"),
-                        "geracao_kwh": row.get("Geração anual (kWh)"),
-                        "distancia_km": row.get("Distância da base (km)"),
-                        "aurum_score": row.get("Aurum Score"),
-                        "campanha": row.get("Campanha"),
-                        "responsavel": row.get("Responsável"),
-                        "estagio": row.get("Estágio"),
-                        "obs": row.get("Obs"),
-                        "salvo_em": row.get("Salvo_em"),
-                    }
-                )
-            cur.executemany(insert_sql, records)
-        conn.commit()
 
 def load_leads_from_neon(usuario: str) -> pd.DataFrame:
     with psycopg2.connect(NEON_DB_URL) as conn:
@@ -1199,60 +1085,6 @@ def ensure_neon_table(conn) -> None:
         )
     conn.commit()
 
-def save_leads_to_neon(df: pd.DataFrame, usuario: str | None = None) -> None:
-    if df.empty:
-        return
-    if not usuario:
-        usuario = st.session_state.get("auth_user")
-    if not usuario:
-        raise ValueError("Usuário não informado para salvar no Neon.")
-    with psycopg2.connect(NEON_DB_URL) as conn:
-        ensure_neon_table(conn)
-        with conn.cursor() as cur:
-            insert_sql = """
-                INSERT INTO aurum_leads (
-                    usuario, nome, telefone, site, email, endereco, categoria, fonte, rating, reviews,
-                    maps_url, latitude, longitude, area_telhado_m2, potencia_kwp, geracao_kwh,
-                    distancia_km, aurum_score, campanha, responsavel, estagio, obs, salvo_em
-                ) VALUES (
-                    %(usuario)s, %(nome)s, %(telefone)s, %(site)s, %(email)s, %(endereco)s, %(categoria)s,
-                    %(fonte)s, %(rating)s, %(reviews)s, %(maps_url)s, %(latitude)s,
-                    %(longitude)s, %(area_telhado_m2)s, %(potencia_kwp)s, %(geracao_kwh)s,
-                    %(distancia_km)s, %(aurum_score)s, %(campanha)s, %(responsavel)s,
-                    %(estagio)s, %(obs)s, %(salvo_em)s
-                );
-            """
-            records = []
-            for _, row in df.iterrows():
-                records.append(
-                    {
-                        "usuario": usuario,
-                        "nome": row.get("Nome"),
-                        "telefone": row.get("Telefone"),
-                        "site": row.get("Site"),
-                        "email": row.get("E-mail"),
-                        "endereco": row.get("Endereço"),
-                        "categoria": row.get("Categoria"),
-                        "fonte": row.get("Fonte"),
-                        "rating": row.get("Rating"),
-                        "reviews": row.get("Reviews"),
-                        "maps_url": row.get("Maps URL"),
-                        "latitude": row.get("Latitude"),
-                        "longitude": row.get("Longitude"),
-                        "area_telhado_m2": row.get("Área telhado (m²)"),
-                        "potencia_kwp": row.get("Potência estimada (kWp)"),
-                        "geracao_kwh": row.get("Geração anual (kWh)"),
-                        "distancia_km": row.get("Distância da base (km)"),
-                        "aurum_score": row.get("Aurum Score"),
-                        "campanha": row.get("Campanha"),
-                        "responsavel": row.get("Responsável"),
-                        "estagio": row.get("Estágio"),
-                        "obs": row.get("Obs"),
-                        "salvo_em": row.get("Salvo_em"),
-                    }
-                )
-            cur.executemany(insert_sql, records)
-        conn.commit()
 
 def load_leads_from_neon(usuario: str) -> pd.DataFrame:
     with psycopg2.connect(NEON_DB_URL) as conn:
@@ -1396,60 +1228,6 @@ def ensure_neon_table(conn) -> None:
         )
     conn.commit()
 
-def save_leads_to_neon(df: pd.DataFrame, usuario: str | None = None) -> None:
-    if df.empty:
-        return
-    if not usuario:
-        usuario = st.session_state.get("auth_user")
-    if not usuario:
-        raise ValueError("Usuário não informado para salvar no Neon.")
-    with psycopg2.connect(NEON_DB_URL) as conn:
-        ensure_neon_table(conn)
-        with conn.cursor() as cur:
-            insert_sql = """
-                INSERT INTO aurum_leads (
-                    usuario, nome, telefone, site, email, endereco, categoria, fonte, rating, reviews,
-                    maps_url, latitude, longitude, area_telhado_m2, potencia_kwp, geracao_kwh,
-                    distancia_km, aurum_score, campanha, responsavel, estagio, obs, salvo_em
-                ) VALUES (
-                    %(usuario)s, %(nome)s, %(telefone)s, %(site)s, %(email)s, %(endereco)s, %(categoria)s,
-                    %(fonte)s, %(rating)s, %(reviews)s, %(maps_url)s, %(latitude)s,
-                    %(longitude)s, %(area_telhado_m2)s, %(potencia_kwp)s, %(geracao_kwh)s,
-                    %(distancia_km)s, %(aurum_score)s, %(campanha)s, %(responsavel)s,
-                    %(estagio)s, %(obs)s, %(salvo_em)s
-                );
-            """
-            records = []
-            for _, row in df.iterrows():
-                records.append(
-                    {
-                        "usuario": usuario,
-                        "nome": row.get("Nome"),
-                        "telefone": row.get("Telefone"),
-                        "site": row.get("Site"),
-                        "email": row.get("E-mail"),
-                        "endereco": row.get("Endereço"),
-                        "categoria": row.get("Categoria"),
-                        "fonte": row.get("Fonte"),
-                        "rating": row.get("Rating"),
-                        "reviews": row.get("Reviews"),
-                        "maps_url": row.get("Maps URL"),
-                        "latitude": row.get("Latitude"),
-                        "longitude": row.get("Longitude"),
-                        "area_telhado_m2": row.get("Área telhado (m²)"),
-                        "potencia_kwp": row.get("Potência estimada (kWp)"),
-                        "geracao_kwh": row.get("Geração anual (kWh)"),
-                        "distancia_km": row.get("Distância da base (km)"),
-                        "aurum_score": row.get("Aurum Score"),
-                        "campanha": row.get("Campanha"),
-                        "responsavel": row.get("Responsável"),
-                        "estagio": row.get("Estágio"),
-                        "obs": row.get("Obs"),
-                        "salvo_em": row.get("Salvo_em"),
-                    }
-                )
-            cur.executemany(insert_sql, records)
-        conn.commit()
 
 def load_leads_from_neon(usuario: str) -> pd.DataFrame:
     with psycopg2.connect(NEON_DB_URL) as conn:
@@ -1593,60 +1371,6 @@ def ensure_neon_table(conn) -> None:
         )
     conn.commit()
 
-def save_leads_to_neon(df: pd.DataFrame, usuario: str | None = None) -> None:
-    if df.empty:
-        return
-    if not usuario:
-        usuario = st.session_state.get("auth_user")
-    if not usuario:
-        raise ValueError("Usuário não informado para salvar no Neon.")
-    with psycopg2.connect(NEON_DB_URL) as conn:
-        ensure_neon_table(conn)
-        with conn.cursor() as cur:
-            insert_sql = """
-                INSERT INTO aurum_leads (
-                    usuario, nome, telefone, site, email, endereco, categoria, fonte, rating, reviews,
-                    maps_url, latitude, longitude, area_telhado_m2, potencia_kwp, geracao_kwh,
-                    distancia_km, aurum_score, campanha, responsavel, estagio, obs, salvo_em
-                ) VALUES (
-                    %(usuario)s, %(nome)s, %(telefone)s, %(site)s, %(email)s, %(endereco)s, %(categoria)s,
-                    %(fonte)s, %(rating)s, %(reviews)s, %(maps_url)s, %(latitude)s,
-                    %(longitude)s, %(area_telhado_m2)s, %(potencia_kwp)s, %(geracao_kwh)s,
-                    %(distancia_km)s, %(aurum_score)s, %(campanha)s, %(responsavel)s,
-                    %(estagio)s, %(obs)s, %(salvo_em)s
-                );
-            """
-            records = []
-            for _, row in df.iterrows():
-                records.append(
-                    {
-                        "usuario": usuario,
-                        "nome": row.get("Nome"),
-                        "telefone": row.get("Telefone"),
-                        "site": row.get("Site"),
-                        "email": row.get("E-mail"),
-                        "endereco": row.get("Endereço"),
-                        "categoria": row.get("Categoria"),
-                        "fonte": row.get("Fonte"),
-                        "rating": row.get("Rating"),
-                        "reviews": row.get("Reviews"),
-                        "maps_url": row.get("Maps URL"),
-                        "latitude": row.get("Latitude"),
-                        "longitude": row.get("Longitude"),
-                        "area_telhado_m2": row.get("Área telhado (m²)"),
-                        "potencia_kwp": row.get("Potência estimada (kWp)"),
-                        "geracao_kwh": row.get("Geração anual (kWh)"),
-                        "distancia_km": row.get("Distância da base (km)"),
-                        "aurum_score": row.get("Aurum Score"),
-                        "campanha": row.get("Campanha"),
-                        "responsavel": row.get("Responsável"),
-                        "estagio": row.get("Estágio"),
-                        "obs": row.get("Obs"),
-                        "salvo_em": row.get("Salvo_em"),
-                    }
-                )
-            cur.executemany(insert_sql, records)
-        conn.commit()
 
 def load_leads_from_neon(usuario: str) -> pd.DataFrame:
     with psycopg2.connect(NEON_DB_URL) as conn:
@@ -1781,56 +1505,6 @@ def ensure_neon_table(conn) -> None:
         )
     conn.commit()
 
-def save_leads_to_neon(df: pd.DataFrame, usuario: str) -> None:
-    if df.empty:
-        return
-    with psycopg2.connect(NEON_DB_URL) as conn:
-        ensure_neon_table(conn)
-        with conn.cursor() as cur:
-            insert_sql = """
-                INSERT INTO aurum_leads (
-                    usuario, nome, telefone, site, email, endereco, categoria, fonte, rating, reviews,
-                    maps_url, latitude, longitude, area_telhado_m2, potencia_kwp, geracao_kwh,
-                    distancia_km, aurum_score, campanha, responsavel, estagio, obs, salvo_em
-                ) VALUES (
-                    %(usuario)s, %(nome)s, %(telefone)s, %(site)s, %(email)s, %(endereco)s, %(categoria)s,
-                    %(fonte)s, %(rating)s, %(reviews)s, %(maps_url)s, %(latitude)s,
-                    %(longitude)s, %(area_telhado_m2)s, %(potencia_kwp)s, %(geracao_kwh)s,
-                    %(distancia_km)s, %(aurum_score)s, %(campanha)s, %(responsavel)s,
-                    %(estagio)s, %(obs)s, %(salvo_em)s
-                );
-            """
-            records = []
-            for _, row in df.iterrows():
-                records.append(
-                    {
-                        "usuario": usuario,
-                        "nome": row.get("Nome"),
-                        "telefone": row.get("Telefone"),
-                        "site": row.get("Site"),
-                        "email": row.get("E-mail"),
-                        "endereco": row.get("Endereço"),
-                        "categoria": row.get("Categoria"),
-                        "fonte": row.get("Fonte"),
-                        "rating": row.get("Rating"),
-                        "reviews": row.get("Reviews"),
-                        "maps_url": row.get("Maps URL"),
-                        "latitude": row.get("Latitude"),
-                        "longitude": row.get("Longitude"),
-                        "area_telhado_m2": row.get("Área telhado (m²)"),
-                        "potencia_kwp": row.get("Potência estimada (kWp)"),
-                        "geracao_kwh": row.get("Geração anual (kWh)"),
-                        "distancia_km": row.get("Distância da base (km)"),
-                        "aurum_score": row.get("Aurum Score"),
-                        "campanha": row.get("Campanha"),
-                        "responsavel": row.get("Responsável"),
-                        "estagio": row.get("Estágio"),
-                        "obs": row.get("Obs"),
-                        "salvo_em": row.get("Salvo_em"),
-                    }
-                )
-            cur.executemany(insert_sql, records)
-        conn.commit()
 
 def load_leads_from_neon(usuario: str) -> pd.DataFrame:
     with psycopg2.connect(NEON_DB_URL) as conn:
@@ -1964,55 +1638,6 @@ def ensure_neon_table(conn) -> None:
         )
     conn.commit()
 
-def save_leads_to_neon(df: pd.DataFrame) -> None:
-    if df.empty:
-        return
-    with psycopg2.connect(NEON_DB_URL) as conn:
-        ensure_neon_table(conn)
-        with conn.cursor() as cur:
-            insert_sql = """
-                INSERT INTO aurum_leads (
-                    nome, telefone, site, email, endereco, categoria, fonte, rating, reviews,
-                    maps_url, latitude, longitude, area_telhado_m2, potencia_kwp, geracao_kwh,
-                    distancia_km, aurum_score, campanha, responsavel, estagio, obs, salvo_em
-                ) VALUES (
-                    %(nome)s, %(telefone)s, %(site)s, %(email)s, %(endereco)s, %(categoria)s,
-                    %(fonte)s, %(rating)s, %(reviews)s, %(maps_url)s, %(latitude)s,
-                    %(longitude)s, %(area_telhado_m2)s, %(potencia_kwp)s, %(geracao_kwh)s,
-                    %(distancia_km)s, %(aurum_score)s, %(campanha)s, %(responsavel)s,
-                    %(estagio)s, %(obs)s, %(salvo_em)s
-                );
-            """
-            records = []
-            for _, row in df.iterrows():
-                records.append(
-                    {
-                        "nome": row.get("Nome"),
-                        "telefone": row.get("Telefone"),
-                        "site": row.get("Site"),
-                        "email": row.get("E-mail"),
-                        "endereco": row.get("Endereço"),
-                        "categoria": row.get("Categoria"),
-                        "fonte": row.get("Fonte"),
-                        "rating": row.get("Rating"),
-                        "reviews": row.get("Reviews"),
-                        "maps_url": row.get("Maps URL"),
-                        "latitude": row.get("Latitude"),
-                        "longitude": row.get("Longitude"),
-                        "area_telhado_m2": row.get("Área telhado (m²)"),
-                        "potencia_kwp": row.get("Potência estimada (kWp)"),
-                        "geracao_kwh": row.get("Geração anual (kWh)"),
-                        "distancia_km": row.get("Distância da base (km)"),
-                        "aurum_score": row.get("Aurum Score"),
-                        "campanha": row.get("Campanha"),
-                        "responsavel": row.get("Responsável"),
-                        "estagio": row.get("Estágio"),
-                        "obs": row.get("Obs"),
-                        "salvo_em": row.get("Salvo_em"),
-                    }
-                )
-            cur.executemany(insert_sql, records)
-        conn.commit()
 
 # ================== Telhado (heurística) ==================
 def pick_roof_polygon_nearest(polygons, poi_lat, poi_lon):
