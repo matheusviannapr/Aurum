@@ -54,6 +54,26 @@ NEON_DB_URL = os.getenv(
     "postgresql://neondb_owner:npg_1U6NcWKILQTS@ep-round-mode-ahr5mg6o-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
 )
 
+AUTH_USERS = {
+    "aurum": "STC",
+    "MarcoBoer": "123456",
+}
+
+NEON_DB_URL = os.getenv(
+    "NEON_DB_URL",
+    "postgresql://neondb_owner:npg_1U6NcWKILQTS@ep-round-mode-ahr5mg6o-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
+)
+
+AUTH_USERS = {
+    "aurum": "STC",
+    "MarcoBoer": "123456",
+}
+
+NEON_DB_URL = os.getenv(
+    "NEON_DB_URL",
+    "postgresql://neondb_owner:npg_1U6NcWKILQTS@ep-round-mode-ahr5mg6o-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
+)
+
 # ---------- Catálogos ----------
 CATEGORIES_PRESETS = {
     "Supermercados / Atacarejos": [
@@ -591,6 +611,339 @@ def load_leads_from_neon(usuario: str) -> pd.DataFrame:
             ORDER BY salvo_em DESC;
         """
         return pd.read_sql(query, conn, params=(usuario,))
+
+def classify_osm_tags(tags: Dict) -> Dict:
+    if not tags:
+        return {"category": "Residencial / Indefinido", "detail": None}
+
+    shop = tags.get("shop")
+    amenity = tags.get("amenity")
+    tourism = tags.get("tourism")
+    office = tags.get("office")
+    industrial = tags.get("industrial")
+    landuse = tags.get("landuse")
+    building = tags.get("building")
+    aeroway = tags.get("aeroway")
+    man_made = tags.get("man_made")
+
+    if shop in {"supermarket", "wholesale", "hypermarket", "convenience", "grocery"} or amenity == "marketplace":
+        return {"category": "Supermercados / Atacarejos", "detail": shop or amenity}
+    if shop == "mall" or amenity == "marketplace":
+        return {"category": "Shoppings / Centros Comerciais", "detail": shop or amenity}
+    if tourism in {"hotel", "hostel", "guest_house", "resort"}:
+        return {"category": "Hotéis / Resorts / Pousadas", "detail": tourism}
+    if amenity in {"fuel", "charging_station"}:
+        return {"category": "Postos / Eletropostos", "detail": amenity}
+    if amenity in {"school", "university", "college"} or office == "government":
+        return {"category": "Escolas / Universidades / Prefeituras", "detail": amenity or office}
+    if amenity in {"hospital", "clinic", "doctors"}:
+        return {"category": "Hospitais / Clínicas / Saúde", "detail": amenity}
+    if man_made == "works":
+        return {"category": "Data Centers / TI Crítica", "detail": man_made}
+    if industrial == "food_processing":
+        return {"category": "Frigoríficos / Câmaras Frias", "detail": industrial}
+    if aeroway in {"aerodrome", "terminal"} or amenity == "ferry_terminal" or landuse == "harbour":
+        return {"category": "Aeroportos / Portos / Terminais", "detail": aeroway or amenity or landuse}
+    if building in {"warehouse", "industrial"} or landuse in {"industrial", "commercial"}:
+        return {"category": "Galpões / Logística / Fábricas", "detail": building or landuse}
+    if building in {"commercial", "office"} or office in {"company", "administrative", "commercial"}:
+        return {"category": "Condomínios Comerciais", "detail": building or office}
+    if building in {"house", "residential", "apartments", "detached", "semidetached_house", "terrace"}:
+        return {"category": "Residencial / Indefinido", "detail": building}
+
+    return {"category": "Residencial / Indefinido", "detail": building or amenity or shop or office}
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def reverse_geocode_bairro(lat: float, lon: float) -> str:
+    url = "https://nominatim.openstreetmap.org/reverse"
+    params = {
+        "format": "jsonv2",
+        "lat": lat,
+        "lon": lon,
+        "zoom": 18,
+        "addressdetails": 1,
+    }
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT_S)
+        data = resp.json()
+    except Exception:
+        return "—"
+    address = data.get("address", {}) or {}
+    return (
+        address.get("suburb")
+        or address.get("neighbourhood")
+        or address.get("city_district")
+        or address.get("quarter")
+        or address.get("village")
+        or "—"
+    )
+
+def ensure_neon_table(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS aurum_leads (
+                id SERIAL PRIMARY KEY,
+                usuario TEXT,
+                nome TEXT,
+                telefone TEXT,
+                site TEXT,
+                email TEXT,
+                endereco TEXT,
+                categoria TEXT,
+                fonte TEXT,
+                rating DOUBLE PRECISION,
+                reviews INTEGER,
+                maps_url TEXT,
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
+                area_telhado_m2 DOUBLE PRECISION,
+                potencia_kwp DOUBLE PRECISION,
+                geracao_kwh DOUBLE PRECISION,
+                distancia_km DOUBLE PRECISION,
+                aurum_score DOUBLE PRECISION,
+                campanha TEXT,
+                responsavel TEXT,
+                estagio TEXT,
+                obs TEXT,
+                salvo_em TIMESTAMP
+            );
+            """
+        )
+    conn.commit()
+
+def save_leads_to_neon(df: pd.DataFrame, usuario: str) -> None:
+    if df.empty:
+        return
+    with psycopg2.connect(NEON_DB_URL) as conn:
+        ensure_neon_table(conn)
+        with conn.cursor() as cur:
+            insert_sql = """
+                INSERT INTO aurum_leads (
+                    usuario, nome, telefone, site, email, endereco, categoria, fonte, rating, reviews,
+                    maps_url, latitude, longitude, area_telhado_m2, potencia_kwp, geracao_kwh,
+                    distancia_km, aurum_score, campanha, responsavel, estagio, obs, salvo_em
+                ) VALUES (
+                    %(usuario)s, %(nome)s, %(telefone)s, %(site)s, %(email)s, %(endereco)s, %(categoria)s,
+                    %(fonte)s, %(rating)s, %(reviews)s, %(maps_url)s, %(latitude)s,
+                    %(longitude)s, %(area_telhado_m2)s, %(potencia_kwp)s, %(geracao_kwh)s,
+                    %(distancia_km)s, %(aurum_score)s, %(campanha)s, %(responsavel)s,
+                    %(estagio)s, %(obs)s, %(salvo_em)s
+                );
+            """
+            records = []
+            for _, row in df.iterrows():
+                records.append(
+                    {
+                        "usuario": usuario,
+                        "nome": row.get("Nome"),
+                        "telefone": row.get("Telefone"),
+                        "site": row.get("Site"),
+                        "email": row.get("E-mail"),
+                        "endereco": row.get("Endereço"),
+                        "categoria": row.get("Categoria"),
+                        "fonte": row.get("Fonte"),
+                        "rating": row.get("Rating"),
+                        "reviews": row.get("Reviews"),
+                        "maps_url": row.get("Maps URL"),
+                        "latitude": row.get("Latitude"),
+                        "longitude": row.get("Longitude"),
+                        "area_telhado_m2": row.get("Área telhado (m²)"),
+                        "potencia_kwp": row.get("Potência estimada (kWp)"),
+                        "geracao_kwh": row.get("Geração anual (kWh)"),
+                        "distancia_km": row.get("Distância da base (km)"),
+                        "aurum_score": row.get("Aurum Score"),
+                        "campanha": row.get("Campanha"),
+                        "responsavel": row.get("Responsável"),
+                        "estagio": row.get("Estágio"),
+                        "obs": row.get("Obs"),
+                        "salvo_em": row.get("Salvo_em"),
+                    }
+                )
+            cur.executemany(insert_sql, records)
+        conn.commit()
+
+def load_leads_from_neon(usuario: str) -> pd.DataFrame:
+    with psycopg2.connect(NEON_DB_URL) as conn:
+        ensure_neon_table(conn)
+        query = """
+            SELECT
+                nome AS "Nome",
+                telefone AS "Telefone",
+                site AS "Site",
+                email AS "E-mail",
+                endereco AS "Endereço",
+                categoria AS "Categoria",
+                fonte AS "Fonte",
+                rating AS "Rating",
+                reviews AS "Reviews",
+                maps_url AS "Maps URL",
+                latitude AS "Latitude",
+                longitude AS "Longitude",
+                area_telhado_m2 AS "Área telhado (m²)",
+                potencia_kwp AS "Potência estimada (kWp)",
+                geracao_kwh AS "Geração anual (kWh)",
+                distancia_km AS "Distância da base (km)",
+                aurum_score AS "Aurum Score",
+                campanha AS "Campanha",
+                responsavel AS "Responsável",
+                estagio AS "Estágio",
+                obs AS "Obs",
+                salvo_em AS "Salvo_em"
+            FROM aurum_leads
+            WHERE usuario = %s
+            ORDER BY salvo_em DESC;
+        """
+        return pd.read_sql(query, conn, params=(usuario,))
+
+def classify_osm_tags(tags: Dict) -> Dict:
+    if not tags:
+        return {"category": "Residencial / Indefinido", "detail": None}
+
+    shop = tags.get("shop")
+    amenity = tags.get("amenity")
+    tourism = tags.get("tourism")
+    office = tags.get("office")
+    industrial = tags.get("industrial")
+    landuse = tags.get("landuse")
+    building = tags.get("building")
+    aeroway = tags.get("aeroway")
+    man_made = tags.get("man_made")
+
+    if shop in {"supermarket", "wholesale", "hypermarket", "convenience", "grocery"} or amenity == "marketplace":
+        return {"category": "Supermercados / Atacarejos", "detail": shop or amenity}
+    if shop == "mall" or amenity == "marketplace":
+        return {"category": "Shoppings / Centros Comerciais", "detail": shop or amenity}
+    if tourism in {"hotel", "hostel", "guest_house", "resort"}:
+        return {"category": "Hotéis / Resorts / Pousadas", "detail": tourism}
+    if amenity in {"fuel", "charging_station"}:
+        return {"category": "Postos / Eletropostos", "detail": amenity}
+    if amenity in {"school", "university", "college"} or office == "government":
+        return {"category": "Escolas / Universidades / Prefeituras", "detail": amenity or office}
+    if amenity in {"hospital", "clinic", "doctors"}:
+        return {"category": "Hospitais / Clínicas / Saúde", "detail": amenity}
+    if man_made == "works":
+        return {"category": "Data Centers / TI Crítica", "detail": man_made}
+    if industrial == "food_processing":
+        return {"category": "Frigoríficos / Câmaras Frias", "detail": industrial}
+    if aeroway in {"aerodrome", "terminal"} or amenity == "ferry_terminal" or landuse == "harbour":
+        return {"category": "Aeroportos / Portos / Terminais", "detail": aeroway or amenity or landuse}
+    if building in {"warehouse", "industrial"} or landuse in {"industrial", "commercial"}:
+        return {"category": "Galpões / Logística / Fábricas", "detail": building or landuse}
+    if building in {"commercial", "office"} or office in {"company", "administrative", "commercial"}:
+        return {"category": "Condomínios Comerciais", "detail": building or office}
+    if building in {"house", "residential", "apartments", "detached", "semidetached_house", "terrace"}:
+        return {"category": "Residencial / Indefinido", "detail": building}
+
+    return {"category": "Residencial / Indefinido", "detail": building or amenity or shop or office}
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def reverse_geocode_bairro(lat: float, lon: float) -> str:
+    url = "https://nominatim.openstreetmap.org/reverse"
+    params = {
+        "format": "jsonv2",
+        "lat": lat,
+        "lon": lon,
+        "zoom": 18,
+        "addressdetails": 1,
+    }
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT_S)
+        data = resp.json()
+    except Exception:
+        return "—"
+    address = data.get("address", {}) or {}
+    return (
+        address.get("suburb")
+        or address.get("neighbourhood")
+        or address.get("city_district")
+        or address.get("quarter")
+        or address.get("village")
+        or "—"
+    )
+
+def ensure_neon_table(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS aurum_leads (
+                id SERIAL PRIMARY KEY,
+                nome TEXT,
+                telefone TEXT,
+                site TEXT,
+                email TEXT,
+                endereco TEXT,
+                categoria TEXT,
+                fonte TEXT,
+                rating DOUBLE PRECISION,
+                reviews INTEGER,
+                maps_url TEXT,
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
+                area_telhado_m2 DOUBLE PRECISION,
+                potencia_kwp DOUBLE PRECISION,
+                geracao_kwh DOUBLE PRECISION,
+                distancia_km DOUBLE PRECISION,
+                aurum_score DOUBLE PRECISION,
+                campanha TEXT,
+                responsavel TEXT,
+                estagio TEXT,
+                obs TEXT,
+                salvo_em TIMESTAMP
+            );
+            """
+        )
+    conn.commit()
+
+def save_leads_to_neon(df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    with psycopg2.connect(NEON_DB_URL) as conn:
+        ensure_neon_table(conn)
+        with conn.cursor() as cur:
+            insert_sql = """
+                INSERT INTO aurum_leads (
+                    nome, telefone, site, email, endereco, categoria, fonte, rating, reviews,
+                    maps_url, latitude, longitude, area_telhado_m2, potencia_kwp, geracao_kwh,
+                    distancia_km, aurum_score, campanha, responsavel, estagio, obs, salvo_em
+                ) VALUES (
+                    %(nome)s, %(telefone)s, %(site)s, %(email)s, %(endereco)s, %(categoria)s,
+                    %(fonte)s, %(rating)s, %(reviews)s, %(maps_url)s, %(latitude)s,
+                    %(longitude)s, %(area_telhado_m2)s, %(potencia_kwp)s, %(geracao_kwh)s,
+                    %(distancia_km)s, %(aurum_score)s, %(campanha)s, %(responsavel)s,
+                    %(estagio)s, %(obs)s, %(salvo_em)s
+                );
+            """
+            records = []
+            for _, row in df.iterrows():
+                records.append(
+                    {
+                        "nome": row.get("Nome"),
+                        "telefone": row.get("Telefone"),
+                        "site": row.get("Site"),
+                        "email": row.get("E-mail"),
+                        "endereco": row.get("Endereço"),
+                        "categoria": row.get("Categoria"),
+                        "fonte": row.get("Fonte"),
+                        "rating": row.get("Rating"),
+                        "reviews": row.get("Reviews"),
+                        "maps_url": row.get("Maps URL"),
+                        "latitude": row.get("Latitude"),
+                        "longitude": row.get("Longitude"),
+                        "area_telhado_m2": row.get("Área telhado (m²)"),
+                        "potencia_kwp": row.get("Potência estimada (kWp)"),
+                        "geracao_kwh": row.get("Geração anual (kWh)"),
+                        "distancia_km": row.get("Distância da base (km)"),
+                        "aurum_score": row.get("Aurum Score"),
+                        "campanha": row.get("Campanha"),
+                        "responsavel": row.get("Responsável"),
+                        "estagio": row.get("Estágio"),
+                        "obs": row.get("Obs"),
+                        "salvo_em": row.get("Salvo_em"),
+                    }
+                )
+            cur.executemany(insert_sql, records)
+        conn.commit()
 
 # ================== Telhado (heurística) ==================
 def pick_roof_polygon_nearest(polygons, poi_lat, poi_lon):
