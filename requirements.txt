@@ -6,3 +6,4 @@ pyproj
 folium
 streamlit-folium
 python-dotenv
+psycopg2-binary
