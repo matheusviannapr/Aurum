@@ -15,9 +15,11 @@ import streamlit as st
 from shapely.geometry import Polygon, MultiPolygon, Point
 from pyproj import Transformer
 import folium
+from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 from dotenv import load_dotenv
 from collections import Counter
+import psycopg2
 
 # ================== Setup básico / Tema ==================
 load_dotenv()
@@ -41,6 +43,16 @@ HEADERS = {"User-Agent": "AurumLeadMapper/1.3.3"}
 REQUEST_TIMEOUT_S = 12
 DETAILS_TIMEOUT_S = 8
 SLEEP_BETWEEN_QUERIES = 0.25
+
+AUTH_USERS = {
+    "aurum": "STC",
+    "MarcoBoer": "123456",
+}
+
+NEON_DB_URL = os.getenv(
+    "NEON_DB_URL",
+    "postgresql://neondb_owner:npg_1U6NcWKILQTS@ep-round-mode-ahr5mg6o-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
+)
 
 # ---------- Catálogos ----------
 CATEGORIES_PRESETS = {
@@ -108,6 +120,7 @@ CATEGORIES_PRESETS = {
         "aeroporto","aeródromo","terminal de cargas","terminal portuário","porto",
         "pátio regulador","retroporto","estação aduaneira","porto seco"
     ],
+    "Residencial / Indefinido": [],
 }
 CATEGORY_WEIGHTS = {
     "Supermercados / Atacarejos": 1.0, "Galpões / Logística / Fábricas": 1.0,
@@ -115,7 +128,8 @@ CATEGORY_WEIGHTS = {
     "Condomínios Comerciais": 0.8, "Postos / Eletropostos": 0.7,
     "Escolas / Universidades / Prefeituras": 0.8,
     "Hospitais / Clínicas / Saúde": 0.9, "Data Centers / TI Crítica": 1.0,
-    "Frigoríficos / Câmaras Frias": 0.9, "Aeroportos / Portos / Terminais": 0.8
+    "Frigoríficos / Câmaras Frias": 0.9, "Aeroportos / Portos / Terminais": 0.8,
+    "Residencial / Indefinido": 0.4
 }
 GOOGLE_TYPES_BY_CATEGORY = {
     "Supermercados / Atacarejos": ["supermarket", "grocery_or_supermarket"],
@@ -172,10 +186,40 @@ OSM_TAGS_BY_CATEGORY = {
 if "df" not in st.session_state: st.session_state.df = None
 if "last_params" not in st.session_state: st.session_state.last_params = None
 if "saved_leads" not in st.session_state: st.session_state.saved_leads = None
+if "auth_user" not in st.session_state: st.session_state.auth_user = None
+if "heatmap_df" not in st.session_state: st.session_state.heatmap_df = None
 # Persistência da aba Maiores Telhados
 if "big_roofs_df" not in st.session_state: st.session_state.big_roofs_df = None
 if "big_roofs_center" not in st.session_state: st.session_state.big_roofs_center = None  # {lat, lon, name}
 if "big_roofs_params" not in st.session_state: st.session_state.big_roofs_params = None  # {radius_km, min_area, topn}
+
+# ================== Login ==================
+def render_login():
+    st.title("🔐 Aurum Lead Mapper")
+    st.caption("Entre com seu usuário para continuar.")
+    with st.form("login_form"):
+        username = st.text_input("Usuário")
+        password = st.text_input("Senha", type="password")
+        submit = st.form_submit_button("Entrar")
+    if submit:
+        if AUTH_USERS.get(username) == password:
+            st.session_state.auth_user = username
+            try:
+                st.session_state.saved_leads = load_leads_from_neon(username)
+            except Exception as e:
+                st.warning(f"Falha ao carregar leads do Neon: {e}")
+            st.success(f"Bem-vindo, {username}!")
+        else:
+            st.error("Usuário ou senha inválidos.")
+
+if not st.session_state.auth_user:
+    render_login()
+    st.stop()
+elif st.session_state.saved_leads is None:
+    try:
+        st.session_state.saved_leads = load_leads_from_neon(st.session_state.auth_user)
+    except Exception as e:
+        st.warning(f"Falha ao carregar leads do Neon: {e}")
 
 # ================== Utilitários geométricos ==================
 def get_utm_epsg(lon: float, lat: float) -> int:
@@ -291,7 +335,7 @@ def overpass_buildings_geom_region(lat: float, lon: float, radius_m: int, limit:
             continue
     return polys
 
-def overpass_poi_search(lat: float, lon: float, radius_m: int, category: str, limit: int = 120) -> List[Dict]:
+def overpass_poi_search(lat: float, lon: float, radius_m: int, category: str, limit: int | None = None) -> List[Dict]:
     tags = OSM_TAGS_BY_CATEGORY.get(category, [])
     if not tags: return []
     filters = " ".join([
@@ -300,10 +344,11 @@ def overpass_poi_search(lat: float, lon: float, radius_m: int, category: str, li
         f'relation["{k}"="{v}"](around:{radius_m},{lat},{lon});'
         for k, v in tags
     ])
+    out_clause = f"out center {limit};" if limit else "out center;"
     query = f"""
     [out:json][timeout:30];
     ( {filters} );
-    out center {limit};
+    {out_clause}
     """
     try:
         data = _overpass_call(query, timeout_s=max(REQUEST_TIMEOUT_S, 20))
@@ -330,7 +375,218 @@ def overpass_poi_search(lat: float, lon: float, radius_m: int, category: str, li
                 "phone": phone, "website": website, "email": email,
                 "category": category
             })
+    return out[:limit] if limit else out
+
+@st.cache_data(ttl=600, show_spinner=False)
+def overpass_buildings_with_tags_region(lat: float, lon: float, radius_m: int, limit: int = 4000) -> List[Dict]:
+    query = f"""
+    [out:json][timeout:90];
+    ( way["building"](around:{radius_m},{lat},{lon});
+      relation["building"](around:{radius_m},{lat},{lon}); );
+    out center tags {limit};
+    """
+    try:
+        data = _overpass_call(query, timeout_s=max(REQUEST_TIMEOUT_S*3, 30))
+    except Exception:
+        return []
+    out = []
+    for el in data.get("elements", []):
+        center = el.get("center") or {}
+        latc, lonc = center.get("lat"), center.get("lon")
+        if latc is None or lonc is None:
+            continue
+        tags = el.get("tags", {}) or {}
+        out.append({
+            "id": el.get("id"),
+            "lat": latc,
+            "lon": lonc,
+            "tags": tags,
+        })
     return out[:limit]
+
+def classify_osm_tags(tags: Dict) -> Dict:
+    if not tags:
+        return {"category": "Residencial / Indefinido", "detail": None}
+
+    shop = tags.get("shop")
+    amenity = tags.get("amenity")
+    tourism = tags.get("tourism")
+    office = tags.get("office")
+    industrial = tags.get("industrial")
+    landuse = tags.get("landuse")
+    building = tags.get("building")
+    aeroway = tags.get("aeroway")
+    man_made = tags.get("man_made")
+
+    if shop in {"supermarket", "wholesale", "hypermarket", "convenience", "grocery"} or amenity == "marketplace":
+        return {"category": "Supermercados / Atacarejos", "detail": shop or amenity}
+    if shop == "mall" or amenity == "marketplace":
+        return {"category": "Shoppings / Centros Comerciais", "detail": shop or amenity}
+    if tourism in {"hotel", "hostel", "guest_house", "resort"}:
+        return {"category": "Hotéis / Resorts / Pousadas", "detail": tourism}
+    if amenity in {"fuel", "charging_station"}:
+        return {"category": "Postos / Eletropostos", "detail": amenity}
+    if amenity in {"school", "university", "college"} or office == "government":
+        return {"category": "Escolas / Universidades / Prefeituras", "detail": amenity or office}
+    if amenity in {"hospital", "clinic", "doctors"}:
+        return {"category": "Hospitais / Clínicas / Saúde", "detail": amenity}
+    if man_made == "works":
+        return {"category": "Data Centers / TI Crítica", "detail": man_made}
+    if industrial == "food_processing":
+        return {"category": "Frigoríficos / Câmaras Frias", "detail": industrial}
+    if aeroway in {"aerodrome", "terminal"} or amenity == "ferry_terminal" or landuse == "harbour":
+        return {"category": "Aeroportos / Portos / Terminais", "detail": aeroway or amenity or landuse}
+    if building in {"warehouse", "industrial"} or landuse in {"industrial", "commercial"}:
+        return {"category": "Galpões / Logística / Fábricas", "detail": building or landuse}
+    if building in {"commercial", "office"} or office in {"company", "administrative", "commercial"}:
+        return {"category": "Condomínios Comerciais", "detail": building or office}
+    if building in {"house", "residential", "apartments", "detached", "semidetached_house", "terrace"}:
+        return {"category": "Residencial / Indefinido", "detail": building}
+
+    return {"category": "Residencial / Indefinido", "detail": building or amenity or shop or office}
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def reverse_geocode_bairro(lat: float, lon: float) -> str:
+    url = "https://nominatim.openstreetmap.org/reverse"
+    params = {
+        "format": "jsonv2",
+        "lat": lat,
+        "lon": lon,
+        "zoom": 18,
+        "addressdetails": 1,
+    }
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT_S)
+        data = resp.json()
+    except Exception:
+        return "—"
+    address = data.get("address", {}) or {}
+    return (
+        address.get("suburb")
+        or address.get("neighbourhood")
+        or address.get("city_district")
+        or address.get("quarter")
+        or address.get("village")
+        or "—"
+    )
+
+def ensure_neon_table(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS aurum_leads (
+                id SERIAL PRIMARY KEY,
+                usuario TEXT,
+                nome TEXT,
+                telefone TEXT,
+                site TEXT,
+                email TEXT,
+                endereco TEXT,
+                categoria TEXT,
+                fonte TEXT,
+                rating DOUBLE PRECISION,
+                reviews INTEGER,
+                maps_url TEXT,
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
+                area_telhado_m2 DOUBLE PRECISION,
+                potencia_kwp DOUBLE PRECISION,
+                geracao_kwh DOUBLE PRECISION,
+                distancia_km DOUBLE PRECISION,
+                aurum_score DOUBLE PRECISION,
+                campanha TEXT,
+                responsavel TEXT,
+                estagio TEXT,
+                obs TEXT,
+                salvo_em TIMESTAMP
+            );
+            """
+        )
+    conn.commit()
+
+def save_leads_to_neon(df: pd.DataFrame, usuario: str) -> None:
+    if df.empty:
+        return
+    with psycopg2.connect(NEON_DB_URL) as conn:
+        ensure_neon_table(conn)
+        with conn.cursor() as cur:
+            insert_sql = """
+                INSERT INTO aurum_leads (
+                    usuario, nome, telefone, site, email, endereco, categoria, fonte, rating, reviews,
+                    maps_url, latitude, longitude, area_telhado_m2, potencia_kwp, geracao_kwh,
+                    distancia_km, aurum_score, campanha, responsavel, estagio, obs, salvo_em
+                ) VALUES (
+                    %(usuario)s, %(nome)s, %(telefone)s, %(site)s, %(email)s, %(endereco)s, %(categoria)s,
+                    %(fonte)s, %(rating)s, %(reviews)s, %(maps_url)s, %(latitude)s,
+                    %(longitude)s, %(area_telhado_m2)s, %(potencia_kwp)s, %(geracao_kwh)s,
+                    %(distancia_km)s, %(aurum_score)s, %(campanha)s, %(responsavel)s,
+                    %(estagio)s, %(obs)s, %(salvo_em)s
+                );
+            """
+            records = []
+            for _, row in df.iterrows():
+                records.append(
+                    {
+                        "usuario": usuario,
+                        "nome": row.get("Nome"),
+                        "telefone": row.get("Telefone"),
+                        "site": row.get("Site"),
+                        "email": row.get("E-mail"),
+                        "endereco": row.get("Endereço"),
+                        "categoria": row.get("Categoria"),
+                        "fonte": row.get("Fonte"),
+                        "rating": row.get("Rating"),
+                        "reviews": row.get("Reviews"),
+                        "maps_url": row.get("Maps URL"),
+                        "latitude": row.get("Latitude"),
+                        "longitude": row.get("Longitude"),
+                        "area_telhado_m2": row.get("Área telhado (m²)"),
+                        "potencia_kwp": row.get("Potência estimada (kWp)"),
+                        "geracao_kwh": row.get("Geração anual (kWh)"),
+                        "distancia_km": row.get("Distância da base (km)"),
+                        "aurum_score": row.get("Aurum Score"),
+                        "campanha": row.get("Campanha"),
+                        "responsavel": row.get("Responsável"),
+                        "estagio": row.get("Estágio"),
+                        "obs": row.get("Obs"),
+                        "salvo_em": row.get("Salvo_em"),
+                    }
+                )
+            cur.executemany(insert_sql, records)
+        conn.commit()
+
+def load_leads_from_neon(usuario: str) -> pd.DataFrame:
+    with psycopg2.connect(NEON_DB_URL) as conn:
+        ensure_neon_table(conn)
+        query = """
+            SELECT
+                nome AS "Nome",
+                telefone AS "Telefone",
+                site AS "Site",
+                email AS "E-mail",
+                endereco AS "Endereço",
+                categoria AS "Categoria",
+                fonte AS "Fonte",
+                rating AS "Rating",
+                reviews AS "Reviews",
+                maps_url AS "Maps URL",
+                latitude AS "Latitude",
+                longitude AS "Longitude",
+                area_telhado_m2 AS "Área telhado (m²)",
+                potencia_kwp AS "Potência estimada (kWp)",
+                geracao_kwh AS "Geração anual (kWh)",
+                distancia_km AS "Distância da base (km)",
+                aurum_score AS "Aurum Score",
+                campanha AS "Campanha",
+                responsavel AS "Responsável",
+                estagio AS "Estágio",
+                obs AS "Obs",
+                salvo_em AS "Salvo_em"
+            FROM aurum_leads
+            WHERE usuario = %s
+            ORDER BY salvo_em DESC;
+        """
+        return pd.read_sql(query, conn, params=(usuario,))
 
 # ================== Telhado (heurística) ==================
 def pick_roof_polygon_nearest(polygons, poi_lat, poi_lon):
@@ -476,6 +732,13 @@ st.title("⚡ Aurum Lead Mapper — prospecção geointeligente")
 st.caption("Overpass POI • Google Nearby + Text • Details • Dashboard • CRM • Maiores Telhados")
 
 with st.sidebar:
+    st.caption(f"Usuário: **{st.session_state.auth_user}**")
+    if st.button("Sair"):
+        st.session_state.auth_user = None
+        st.session_state.heatmap_df = None
+        st.session_state.saved_leads = None
+        st.rerun()
+
     st.header("🔧 Configurações")
     if st.button("🧹 Limpar cache (dados)"):
         st.cache_data.clear()
@@ -501,10 +764,14 @@ with st.sidebar:
         base_lon = st.number_input("Base lon", value=-43.1034, format="%.6f")
 
         st.markdown("**Busca**")
+        collect_mode = st.selectbox(
+            "Modo de coleta",
+            ["Categoria / palavras-chave", "Cobertura total (OSM: todos edifícios)"]
+        )
         category = st.selectbox("Categoria", list(CATEGORIES_PRESETS.keys()))
         keywords_default = ", ".join(CATEGORIES_PRESETS[category])
         keywords = st.text_area("Palavras-chave (vírgulas)", value=keywords_default, height=80)
-        max_results = st.slider("Máx. locais por fonte", 10, 120, 100, 10)
+        max_results = st.slider("Máximo de leads (parar quando atingir)", 50, 5000, 500, 50)
         use_google = st.checkbox("Usar Google Places (requer API key)", value=bool(gkey))
         use_osm = st.checkbox("Usar OSM Overpass POI", value=True)
 
@@ -517,19 +784,23 @@ with st.sidebar:
         overpass_enable = st.checkbox("Usar Overpass p/ telhados (OSM)", value=True)
         per_kw_limit = st.slider("Limite por palavra (p/ fonte)", 5, 60, 40, 5)
         overpass_radius_m = st.slider("Raio Overpass telhado (m)", 50, 400, 220, 10)
-        global_time_budget_s = st.slider("Orçamento de tempo da busca (s)", 5, 999, 90, 5)
 
         run_btn = st.form_submit_button("🚀 Executar mapeamento")
 
 # ================== Execução principal ==================
 if run_btn:
-    t0 = time.time()
     status = st.status("Iniciando busca…", expanded=True)
     status.update(label="Geocodificando região alvo…", state="running")
 
     target = geocode_location(custom_location, gkey if use_google else "")
     lat0, lon0 = target["lat"], target["lon"]
     radius_m = int(radius_km * 1000)
+
+    if collect_mode == "Cobertura total (OSM: todos edifícios)":
+        use_google = False
+        use_osm = True
+        supplement_nominatim = False
+        enrich_details = False
 
     if fast_mode:
         max_results = min(max_results, 60)
@@ -551,28 +822,58 @@ if run_btn:
 
     # 1) OSM primeiro (alto volume)
     if use_osm:
-        if time.time() - t0 <= global_time_budget_s:
-            try:
-                data = overpass_poi_search(lat0, lon0, radius_m, category,
-                                           limit=max(per_kw, 100 if not fast_mode else 40))
+        try:
+            if collect_mode == "Cobertura total (OSM: todos edifícios)":
+                data = overpass_buildings_with_tags_region(lat0, lon0, radius_m, limit=max_results)
                 for d in data:
+                    if len(results) >= max_results:
+                        break
+                    tags = d.get("tags", {}) or {}
+                    classification = classify_osm_tags(tags)
+                    name = tags.get("name") or tags.get("addr:housename")
+                    if not name:
+                        name = "Residência" if classification["category"] == "Residencial / Indefinido" else f"Edificação {d.get('id')}"
+                    k = (round(d["lat"], 6), round(d["lon"], 6), name)
+                    if k not in seen:
+                        seen.add(k)
+                        results.append({
+                            "name": name,
+                            "address": tags.get("addr:full") or tags.get("addr:street"),
+                            "lat": d["lat"],
+                            "lon": d["lon"],
+                            "source": "osm_buildings",
+                            "osm_id": d.get("id"),
+                            "class": tags.get("building"),
+                            "type": classification.get("detail"),
+                            "phone": tags.get("contact:phone") or tags.get("phone"),
+                            "website": tags.get("contact:website") or tags.get("website"),
+                            "email": tags.get("contact:email") or tags.get("email"),
+                            "category": classification["category"],
+                        })
+            else:
+                data = overpass_poi_search(lat0, lon0, radius_m, category, limit=max_results)
+                for d in data:
+                    if len(results) >= max_results:
+                        break
                     k = (round(d["lat"],6), round(d["lon"],6), d["name"])
                     if k not in seen:
                         seen.add(k); results.append(d)
-            except Exception as e:
-                st.warning(f"OSM POI falhou: {e}")
+        except Exception as e:
+            st.warning(f"OSM POI falhou: {e}")
         steps_done += 1; prog.progress(min(1.0, steps_done / total_steps))
 
     # 2) Google Nearby (types)
     if use_google and gkey:
         gtypes = GOOGLE_TYPES_BY_CATEGORY.get(category, [])
         for gtype in gtypes:
-            if time.time() - t0 > global_time_budget_s: 
-                status.update(label="Tempo esgotado no Google Nearby; seguindo…", state="error"); break
+            if len(results) >= max_results:
+                break
             try:
                 data = google_places_nearby(lat0, lon0, radius_m, gtype=gtype,
                                             max_results=min(per_kw, max_results), api_key=gkey)
                 for d in data:
+                    if len(results) >= max_results:
+                        break
                     k = (round(d["lat"],6), round(d["lon"],6), d["name"])
                     if k not in seen:
                         d["category"] = category; seen.add(k); results.append(d)
@@ -584,14 +885,16 @@ if run_btn:
     # 3) Google Text Search (keywords)
     if use_google and gkey and keys:
         for kw in keys:
-            if time.time() - t0 > global_time_budget_s:
-                status.update(label="Tempo esgotado no Google Text; seguindo…", state="error"); break
+            if len(results) >= max_results:
+                break
             try:
                 data = google_places_text_search(
                     f"{kw} near {custom_location}", lat0, lon0, radius_m,
                     max_results=min(per_kw, max_results), api_key=gkey
                 )
                 for d in data:
+                    if len(results) >= max_results:
+                        break
                     k = (round(d["lat"],6), round(d["lon"],6), d["name"])
                     if k not in seen:
                         d["category"] = category; seen.add(k); results.append(d)
@@ -622,10 +925,12 @@ if run_btn:
                 pass
         return out[:limit]
 
-    if supplement_nominatim:
+    if supplement_nominatim and len(results) < max_results:
         try:
             extra = osm_nominatim_search(category + " " + custom_location, lat0, lon0, radius_m, limit=50)
             for d in extra:
+                if len(results) >= max_results:
+                    break
                 k = (round(d["lat"],6), round(d["lon"],6), d["name"])
                 if k not in seen:
                     seen.add(k); results.append(d)
@@ -644,8 +949,6 @@ if run_btn:
     # Details (opcional)
     if enrich_details and gkey:
         for i, item in enumerate(results[:min(150, len(results))]):
-            if time.time() - t0 > global_time_budget_s:
-                status.update(label="Tempo esgotado no Details; seguindo…", state="error"); break
             if item.get("source","").startswith("google") and item.get("place_id"):
                 det = google_place_details(item["place_id"], gkey)
                 if det:
@@ -667,14 +970,10 @@ if run_btn:
         lat, lon = r["lat"], r["lon"]
         buildings = []
         if overpass_enable:
-            if time.time() - t0 > global_time_budget_s:
-                status.update(label="Tempo esgotado no Overpass telhados; continuará sem telhado.", state="error")
-                overpass_enable = False
-            else:
-                try:
-                    buildings = overpass_buildings_around(lat, lon, radius_m=overpass_radius_m)
-                except Exception:
-                    buildings = []
+            try:
+                buildings = overpass_buildings_around(lat, lon, radius_m=overpass_radius_m)
+            except Exception:
+                buildings = []
 
         area_m2 = estimate_rooftop_area_m2(buildings, poi_lat=lat, poi_lon=lon, mode=roof_mode) if buildings else 0.0
         kwp = estimate_kwp(area_m2, area_per_kwp=area_per_kwp, coverage_ratio=coverage_ratio)
@@ -704,8 +1003,7 @@ if run_btn:
         if (i+1) % 20 == 0:
             st.caption(f"Processados {i+1}/{len(results)}…")
 
-        if time.time() - t0 > global_time_budget_s:
-            st.warning(f"Interrompido por orçamento de tempo. Processados {i+1} itens.")
+        if len(rows) >= max_results:
             break
 
     if rows:
@@ -722,8 +1020,8 @@ if run_btn:
         status.update(label="Sem linhas para exibir (veja avisos acima).", state="error")
 
 # ================== Abas (inclui Maiores Telhados) ==================
-tab_dash, tab_map, tab_saved, tab_bigroofs = st.tabs(
-    ["📊 Dashboard", "🗺️ Mapeamento atual", "📦 Leads salvos", "🏢 Maiores Telhados"]
+tab_dash, tab_map, tab_heatmap, tab_saved, tab_bigroofs = st.tabs(
+    ["📊 Dashboard", "🗺️ Mapeamento atual", "🔥 Heatmap por Bairro", "📦 Leads salvos", "🏢 Maiores Telhados"]
 )
 
 # ---------- Dashboard ----------
@@ -815,6 +1113,7 @@ with tab_map:
             df_to_save["Estágio"] = estagio
             df_to_save["Obs"] = obs
             df_to_save["Salvo_em"] = ts.strftime("%Y-%m-%d %H:%M:%S")
+            df_to_save["Usuário"] = st.session_state.auth_user
 
             if st.session_state.saved_leads is None or st.session_state.saved_leads.empty:
                 merged = df_to_save
@@ -824,6 +1123,11 @@ with tab_map:
             merged.drop_duplicates(subset=["Nome","Latitude","Longitude"], keep="first", inplace=True)
             st.session_state.saved_leads = merged
             st.success(f"Salvo! Banco agora tem {len(st.session_state.saved_leads)} leads únicos.")
+            try:
+                save_leads_to_neon(df_to_save, st.session_state.auth_user)
+                st.success("Leads enviados para o banco Neon.")
+            except Exception as e:
+                st.warning(f"Falha ao salvar no Neon: {e}")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -847,6 +1151,57 @@ with tab_map:
                                mime="application/geo+json")
     else:
         st.info("Execute um mapeamento na barra lateral.")
+
+# ---------- Heatmap por Bairro ----------
+with tab_heatmap:
+    st.subheader("🔥 Heatmap por Bairro")
+    df = st.session_state.saved_leads
+
+    if df is None or df.empty:
+        st.info("Sem leads salvos para gerar o heatmap por bairro.")
+    else:
+        categories = ["Todos"] + sorted(df["Categoria"].dropna().unique().tolist())
+        with st.form("heatmap_form"):
+            hm_category = st.selectbox("Tipo de negócio/edificação", categories)
+            hm_limit = st.slider("Máx. pontos para geocodificar (Nominatim)", 50, 1000, 250, 50)
+            hm_submit = st.form_submit_button("Gerar heatmap")
+
+        if hm_submit:
+            df_filtered = df if hm_category == "Todos" else df[df["Categoria"] == hm_category]
+            if df_filtered.empty:
+                st.warning("Sem dados para esse filtro.")
+                st.session_state.heatmap_df = None
+            else:
+                if len(df_filtered) > hm_limit:
+                    df_sample = df_filtered.sample(n=hm_limit, random_state=42)
+                else:
+                    df_sample = df_filtered.copy()
+                st.info("Calculando bairros via Nominatim (pode levar alguns segundos)…")
+                df_sample["Bairro"] = df_sample.apply(
+                    lambda r: reverse_geocode_bairro(r["Latitude"], r["Longitude"]),
+                    axis=1
+                )
+                st.session_state.heatmap_df = df_sample
+
+        hm_df = st.session_state.heatmap_df
+        if hm_df is None or hm_df.empty:
+            st.info("Clique em **Gerar heatmap** para montar o mapa por bairro.")
+        else:
+            grouped = hm_df.groupby("Bairro", dropna=False).agg(
+                leads=("Nome", "count"),
+                lat=("Latitude", "mean"),
+                lon=("Longitude", "mean")
+            ).reset_index().sort_values("leads", ascending=False)
+
+            st.markdown("### 📊 Concentração por bairro")
+            st.dataframe(grouped, use_container_width=True)
+
+            center_lat = hm_df["Latitude"].mean()
+            center_lon = hm_df["Longitude"].mean()
+            m_heat = folium.Map(location=[center_lat, center_lon], zoom_start=12, control_scale=True, tiles="OpenStreetMap")
+            heat_data = [[row["lat"], row["lon"], row["leads"]] for _, row in grouped.iterrows()]
+            HeatMap(heat_data, radius=25, blur=18, max_zoom=14).add_to(m_heat)
+            st_folium(m_heat, width=1200, height=600)
 
 # ---------- Leads salvos ----------
 with tab_saved:
