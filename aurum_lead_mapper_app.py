@@ -339,6 +339,32 @@ def estimate_simple_roof_area_m2(category: str, rating: float | None, reviews: i
     area = base_area * weight * rating_factor * review_factor
     return round(min(max(area, 150.0), 6000.0), 1)
 
+def find_nearest_roof_area_m2(lat: float, lon: float, candidates: List[Tuple[float, float, float]], max_km: float = 0.3) -> float | None:
+    if not candidates:
+        return None
+    best_dist = None
+    best_area = None
+    for c_lat, c_lon, area_m2 in candidates:
+        dist = haversine_km(lat, lon, c_lat, c_lon)
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_area = area_m2
+    if best_dist is not None and best_dist <= max_km:
+        return round(best_area, 1)
+    return None
+
+def estimate_simple_roof_area_m2(category: str, rating: float | None, reviews: int | None) -> float:
+    base_area = 800.0
+    weight = CATEGORY_WEIGHTS.get(category, 0.7)
+    rating_val = float(rating) if rating is not None else 0.0
+    rating_val = max(0.0, min(5.0, rating_val))
+    rating_factor = 1.0 + ((rating_val - 3.0) * 0.08)
+    review_val = int(reviews) if reviews is not None else 0
+    review_val = max(0, review_val)
+    review_factor = 1.0 + min(math.log10(review_val + 1.0), 2.0) * 0.18
+    area = base_area * weight * rating_factor * review_factor
+    return round(min(max(area, 150.0), 6000.0), 1)
+
 # ================== Overpass helpers (mirrors + retry) ==================
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -2096,6 +2122,25 @@ if run_btn:
                 st.caption(f"…details {i+1} / {min(150, len(results))}")
             time.sleep(0.08)
 
+    roof_candidates: List[Tuple[float, float, float]] = []
+    if volume_mode:
+        status.update(label="Carregando telhados rápidos…", state="running")
+        try:
+            limit = min(max_results * 4, 2000)
+            polys = overpass_buildings_geom_region(lat0, lon0, radius_m, limit=limit)
+            for poly in polys:
+                area_m2 = project_area_m2(poly)
+                if area_m2 <= 0:
+                    continue
+                centroid = poly.centroid
+                roof_candidates.append((centroid.y, centroid.x, area_m2))
+        except Exception:
+            roof_candidates = []
+        if roof_candidates:
+            st.caption(f"Telhados carregados: {len(roof_candidates)}")
+        else:
+            st.caption("Sem telhados carregados; usando estimativa simples.")
+
     if volume_mode:
         status.update(label="Finalizando (modo volume)…", state="running")
     else:
@@ -2107,11 +2152,13 @@ if run_btn:
         lat, lon = r["lat"], r["lon"]
         dist = haversine_km(base_lat, base_lon, lat, lon)
         if volume_mode:
-            area_m2 = estimate_simple_roof_area_m2(
-                r.get("category", category),
-                r.get("rating"),
-                r.get("reviews"),
-            )
+            area_m2 = find_nearest_roof_area_m2(lat, lon, roof_candidates)
+            if area_m2 is None:
+                area_m2 = estimate_simple_roof_area_m2(
+                    r.get("category", category),
+                    r.get("rating"),
+                    r.get("reviews"),
+                )
             kwp = 0.0
             gen = 0.0
             score = 0.0
