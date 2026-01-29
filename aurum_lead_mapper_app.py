@@ -2153,7 +2153,8 @@ if run_btn:
         st.session_state.df = df
         st.session_state.last_params = {
             "local": custom_location, "raio_km": radius_km, "categoria": category,
-            "base_lat": base_lat, "base_lon": base_lon, "roof_mode": roof_mode
+            "base_lat": base_lat, "base_lon": base_lon, "roof_mode": roof_mode,
+            "volume_mode": volume_mode,
         }
         status.update(label="Concluído ✅", state="complete")
     else:
@@ -2194,10 +2195,17 @@ with tab_dash:
         st.dataframe(by_cat, use_container_width=True)
 
         st.markdown("**Top 10 por Score**")
-        st.dataframe(
-            df[["Nome","Categoria","Aurum Score","Potência estimada (kWp)","Geração anual (kWh)","Endereço"]].head(10),
-            use_container_width=True
-        )
+        params = st.session_state.last_params or {}
+        if params.get("volume_mode"):
+            st.dataframe(
+                df[["Nome","Categoria","Latitude","Longitude","Endereço"]].head(10),
+                use_container_width=True
+            )
+        else:
+            st.dataframe(
+                df[["Nome","Categoria","Aurum Score","Potência estimada (kWp)","Geração anual (kWh)","Endereço"]].head(10),
+                use_container_width=True
+            )
 
 # ---------- Mapeamento atual ----------
 with tab_map:
