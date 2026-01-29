@@ -8,11 +8,12 @@
 # - Aba "Maiores Telhados" com persistência (sem “pisca e some”)
 
 import os, math, time, json
+from functools import lru_cache
 from typing import List, Dict, Optional, Set, Tuple
 import pandas as pd
 import requests
 import streamlit as st
-from shapely.geometry import Polygon, MultiPolygon, Point
+from shapely.geometry import Polygon, MultiPolygon
 from pyproj import Transformer
 import folium
 from folium.plugins import HeatMap
@@ -287,11 +288,15 @@ def get_utm_epsg(lon: float, lat: float) -> int:
     zone = int((lon + 180) // 6) + 1
     return int(f"327{zone:02d}" if lat < 0 else f"326{zone:02d}")
 
+@lru_cache(maxsize=64)
+def _utm_transformer(epsg: int) -> Transformer:
+    return Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+
 def project_area_m2(geom) -> float:
     try:
         centroid = geom.centroid
         epsg = get_utm_epsg(centroid.x, centroid.y)
-        tr = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+        tr = _utm_transformer(epsg)
         def _p(coords): return [tr.transform(x, y) for (x, y) in coords]
         if isinstance(geom, Polygon):
             return abs(Polygon(_p(list(geom.exterior.coords)),
@@ -330,6 +335,15 @@ OVERPASS_ENDPOINTS = [
     "https://z.overpass-api.de/api/interpreter",
 ]
 
+def round_overpass_coords(lat: float, lon: float, radius_m: int) -> Tuple[float, float]:
+    if radius_m >= 200:
+        decimals = 3
+    elif radius_m >= 120:
+        decimals = 4
+    else:
+        decimals = 5
+    return round(lat, decimals), round(lon, decimals)
+
 def _overpass_call(query: str, timeout_s: int = REQUEST_TIMEOUT_S):
     last_err = None
     for url in OVERPASS_ENDPOINTS:
@@ -352,22 +366,23 @@ def overpass_buildings_around(lat: float, lon: float, radius_m: int = 200) -> Li
     [out:json][timeout:25];
     ( way["building"](around:{radius_m},{lat},{lon});
       relation["building"](around:{radius_m},{lat},{lon}); );
-    out body; >; out skel qt;
+    out geom;
     """
     polys = []
     try:
         data = _overpass_call(query, timeout_s=max(REQUEST_TIMEOUT_S, 20))
         elems = data.get("elements", [])
-        nodes = {e["id"]:(e["lon"], e["lat"]) for e in elems if e["type"]=="node"}
         for e in elems:
-            if e["type"]=="way" and "nodes" in e:
-                coords = [nodes.get(n) for n in e["nodes"] if n in nodes]
-                if coords and len(coords) >= 3:
-                    try:
-                        poly = Polygon(coords)
-                        if poly.is_valid and poly.area > 0: polys.append(poly)
-                    except Exception:
-                        pass
+            geom = e.get("geometry")
+            if not geom or len(geom) < 3:
+                continue
+            try:
+                coords = [(pt["lon"], pt["lat"]) for pt in geom]
+                poly = Polygon(coords)
+                if poly.is_valid and poly.area > 0:
+                    polys.append(poly)
+            except Exception:
+                pass
     except Exception:
         pass
     return polys
@@ -1640,30 +1655,32 @@ def ensure_neon_table(conn) -> None:
 
 
 # ================== Telhado (heurística) ==================
-def pick_roof_polygon_nearest(polygons, poi_lat, poi_lon):
-    poi = Point(poi_lon, poi_lat)
-    def dist(poly): c = poly.centroid; return haversine_km(poi.y, poi.x, c.y, c.x)
-    return min(polygons, key=dist)
-
-def pick_roof_polygon_hybrid(polygons, poi_lat, poi_lon, w_area=0.6, w_near=0.4):
-    areas = [project_area_m2(p) for p in polygons]; max_a = max(areas) or 1.0
-    dists = [haversine_km(poi_lat, poi_lon, p.centroid.y, p.centroid.x) for p in polygons]; max_d = max(dists) or 1.0
-    scores = []
-    for a, d in zip(areas, dists):
-        area_score = a / max_a
-        near_score = 1.0 - (d / max_d)
-        scores.append(w_area*area_score + w_near*near_score)
-    return polygons[scores.index(max(scores))]
-
 def estimate_rooftop_area_m2(polygons, poi_lat=None, poi_lon=None, mode="largest"):
-    if not polygons: return 0.0
-    if mode == "nearest" and poi_lat is not None:
-        chosen = pick_roof_polygon_nearest(polygons, poi_lat, poi_lon)
-    elif mode == "hybrid" and poi_lat is not None:
-        chosen = pick_roof_polygon_hybrid(polygons, poi_lat, poi_lon)
-    else:
-        chosen = max(polygons, key=lambda p: project_area_m2(p))
-    return project_area_m2(chosen) if chosen is not None else 0.0
+    if not polygons:
+        return 0.0
+    areas = [project_area_m2(p) for p in polygons]
+    if mode == "nearest" and poi_lat is not None and poi_lon is not None:
+        idx = min(
+            range(len(polygons)),
+            key=lambda i: haversine_km(
+                poi_lat, poi_lon, polygons[i].centroid.y, polygons[i].centroid.x
+            ),
+        )
+        return areas[idx]
+    if mode == "hybrid" and poi_lat is not None and poi_lon is not None:
+        max_a = max(areas) or 1.0
+        dists = [
+            haversine_km(poi_lat, poi_lon, p.centroid.y, p.centroid.x)
+            for p in polygons
+        ]
+        max_d = max(dists) or 1.0
+        scores = []
+        for a, d in zip(areas, dists):
+            area_score = a / max_a
+            near_score = 1.0 - (d / max_d)
+            scores.append(0.6 * area_score + 0.4 * near_score)
+        return areas[scores.index(max(scores))]
+    return max(areas) if areas else 0.0
 
 # ================== Geocodificação e Google APIs ==================
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -2063,7 +2080,8 @@ if run_btn:
         buildings = []
         if overpass_enable:
             try:
-                buildings = overpass_buildings_around(lat, lon, radius_m=overpass_radius_m)
+                lat_q, lon_q = round_overpass_coords(lat, lon, overpass_radius_m)
+                buildings = overpass_buildings_around(lat_q, lon_q, radius_m=overpass_radius_m)
             except Exception:
                 buildings = []
 
