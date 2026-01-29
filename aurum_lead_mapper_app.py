@@ -327,6 +327,18 @@ def aurum_score(category: str, area_m2: float, distance_km: float, base_weight: 
     dist_score = 1.0 / (1.0 + (distance_km/20.0))
     return round(100.0 * w_cat * area_score * dist_score * base_weight, 1)
 
+def estimate_simple_roof_area_m2(category: str, rating: float | None, reviews: int | None) -> float:
+    base_area = 800.0
+    weight = CATEGORY_WEIGHTS.get(category, 0.7)
+    rating_val = float(rating) if rating is not None else 0.0
+    rating_val = max(0.0, min(5.0, rating_val))
+    rating_factor = 1.0 + ((rating_val - 3.0) * 0.08)
+    review_val = int(reviews) if reviews is not None else 0
+    review_val = max(0, review_val)
+    review_factor = 1.0 + min(math.log10(review_val + 1.0), 2.0) * 0.18
+    area = base_area * weight * rating_factor * review_factor
+    return round(min(max(area, 150.0), 6000.0), 1)
+
 # ================== Overpass helpers (mirrors + retry) ==================
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -2095,7 +2107,11 @@ if run_btn:
         lat, lon = r["lat"], r["lon"]
         dist = haversine_km(base_lat, base_lon, lat, lon)
         if volume_mode:
-            area_m2 = 0.0
+            area_m2 = estimate_simple_roof_area_m2(
+                r.get("category", category),
+                r.get("rating"),
+                r.get("reviews"),
+            )
             kwp = 0.0
             gen = 0.0
             score = 0.0
