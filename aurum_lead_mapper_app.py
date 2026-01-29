@@ -353,6 +353,18 @@ def find_nearest_roof_area_m2(lat: float, lon: float, candidates: List[Tuple[flo
         return round(best_area, 1)
     return None
 
+def estimate_simple_roof_area_m2(category: str, rating: float | None, reviews: int | None) -> float:
+    base_area = 800.0
+    weight = CATEGORY_WEIGHTS.get(category, 0.7)
+    rating_val = float(rating) if rating is not None else 0.0
+    rating_val = max(0.0, min(5.0, rating_val))
+    rating_factor = 1.0 + ((rating_val - 3.0) * 0.08)
+    review_val = int(reviews) if reviews is not None else 0
+    review_val = max(0, review_val)
+    review_factor = 1.0 + min(math.log10(review_val + 1.0), 2.0) * 0.18
+    area = base_area * weight * rating_factor * review_factor
+    return round(min(max(area, 150.0), 6000.0), 1)
+
 # ================== Overpass helpers (mirrors + retry) ==================
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
