@@ -327,6 +327,18 @@ def aurum_score(category: str, area_m2: float, distance_km: float, base_weight: 
     dist_score = 1.0 / (1.0 + (distance_km/20.0))
     return round(100.0 * w_cat * area_score * dist_score * base_weight, 1)
 
+def estimate_simple_roof_area_m2(category: str, rating: float | None, reviews: int | None) -> float:
+    base_area = 800.0
+    weight = CATEGORY_WEIGHTS.get(category, 0.7)
+    rating_val = float(rating) if rating is not None else 0.0
+    rating_val = max(0.0, min(5.0, rating_val))
+    rating_factor = 1.0 + ((rating_val - 3.0) * 0.08)
+    review_val = int(reviews) if reviews is not None else 0
+    review_val = max(0, review_val)
+    review_factor = 1.0 + min(math.log10(review_val + 1.0), 2.0) * 0.18
+    area = base_area * weight * rating_factor * review_factor
+    return round(min(max(area, 150.0), 6000.0), 1)
+
 # ================== Overpass helpers (mirrors + retry) ==================
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -1868,6 +1880,11 @@ with st.sidebar:
         roof_mode = st.selectbox("Escolha", ["largest","nearest","hybrid"])
 
         st.markdown("**Depuração / Performance**")
+        volume_mode = st.checkbox(
+            "Modo volume (sem score/telhado)",
+            value=False,
+            help="Desativa estimativas (telhado/kWp/score) e Details para priorizar velocidade."
+        )
         fast_mode = st.checkbox("Modo Rápido (debug)", value=False,
                                 help="Limita resultados e desativa Details para evitar travar.")
         overpass_enable = st.checkbox("Usar Overpass p/ telhados (OSM)", value=True)
@@ -1885,11 +1902,19 @@ if run_btn:
     lat0, lon0 = target["lat"], target["lon"]
     radius_m = int(radius_km * 1000)
 
+    use_building_coverage = collect_mode == "Cobertura total (OSM: todos edifícios)"
     if collect_mode == "Cobertura total (OSM: todos edifícios)":
         use_google = False
         use_osm = True
         supplement_nominatim = False
         enrich_details = False
+
+    if volume_mode:
+        enrich_details = False
+        overpass_enable = False
+        if use_building_coverage:
+            use_building_coverage = False
+            st.info("Modo volume ativo: ignorando 'Cobertura total' para evitar processamento pesado.")
 
     if fast_mode:
         max_results = min(max_results, 60)
@@ -1914,7 +1939,7 @@ if run_btn:
     # 1) OSM primeiro (alto volume)
     if use_osm:
         try:
-            if collect_mode == "Cobertura total (OSM: todos edifícios)":
+            if use_building_coverage:
                 data = overpass_buildings_with_tags_region(lat0, lon0, radius_m, limit=max_results)
                 for d in data:
                     if len(results) >= max_results:
@@ -2071,25 +2096,38 @@ if run_btn:
                 st.caption(f"…details {i+1} / {min(150, len(results))}")
             time.sleep(0.08)
 
-    status.update(label="Estimando telhados e kWp…", state="running")
+    if volume_mode:
+        status.update(label="Finalizando (modo volume)…", state="running")
+    else:
+        status.update(label="Estimando telhados e kWp…", state="running")
 
     # Estimação FV + score
     rows = []
     for i, r in enumerate(results):
         lat, lon = r["lat"], r["lon"]
-        buildings = []
-        if overpass_enable:
-            try:
-                lat_q, lon_q = round_overpass_coords(lat, lon, overpass_radius_m)
-                buildings = overpass_buildings_around(lat_q, lon_q, radius_m=overpass_radius_m)
-            except Exception:
-                buildings = []
-
-        area_m2 = estimate_rooftop_area_m2(buildings, poi_lat=lat, poi_lon=lon, mode=roof_mode) if buildings else 0.0
-        kwp = estimate_kwp(area_m2, area_per_kwp=area_per_kwp, coverage_ratio=coverage_ratio)
-        gen = estimate_generation_kwh_year(kwp, specific_yield=specific_yield)
         dist = haversine_km(base_lat, base_lon, lat, lon)
-        score = aurum_score(r.get("category", category), area_m2, dist)
+        if volume_mode:
+            area_m2 = estimate_simple_roof_area_m2(
+                r.get("category", category),
+                r.get("rating"),
+                r.get("reviews"),
+            )
+            kwp = 0.0
+            gen = 0.0
+            score = 0.0
+        else:
+            buildings = []
+            if overpass_enable:
+                try:
+                    lat_q, lon_q = round_overpass_coords(lat, lon, overpass_radius_m)
+                    buildings = overpass_buildings_around(lat_q, lon_q, radius_m=overpass_radius_m)
+                except Exception:
+                    buildings = []
+
+            area_m2 = estimate_rooftop_area_m2(buildings, poi_lat=lat, poi_lon=lon, mode=roof_mode) if buildings else 0.0
+            kwp = estimate_kwp(area_m2, area_per_kwp=area_per_kwp, coverage_ratio=coverage_ratio)
+            gen = estimate_generation_kwh_year(kwp, specific_yield=specific_yield)
+            score = aurum_score(r.get("category", category), area_m2, dist)
 
         rows.append({
             "Nome": r.get("name"),
@@ -2117,13 +2155,22 @@ if run_btn:
             break
 
     if rows:
-        df = pd.DataFrame(rows).sort_values(
-            by=["Aurum Score","Potência estimada (kWp)","Área telhado (m²)"], ascending=False
-        )
+        df = pd.DataFrame(rows)
+        if volume_mode:
+            df = df.sort_values(
+                by=["Distância da base (km)", "Rating", "Reviews"],
+                ascending=[True, False, False],
+                na_position="last"
+            )
+        else:
+            df = df.sort_values(
+                by=["Aurum Score","Potência estimada (kWp)","Área telhado (m²)"], ascending=False
+            )
         st.session_state.df = df
         st.session_state.last_params = {
             "local": custom_location, "raio_km": radius_km, "categoria": category,
-            "base_lat": base_lat, "base_lon": base_lon, "roof_mode": roof_mode
+            "base_lat": base_lat, "base_lon": base_lon, "roof_mode": roof_mode,
+            "volume_mode": volume_mode,
         }
         status.update(label="Concluído ✅", state="complete")
     else:
@@ -2164,10 +2211,17 @@ with tab_dash:
         st.dataframe(by_cat, use_container_width=True)
 
         st.markdown("**Top 10 por Score**")
-        st.dataframe(
-            df[["Nome","Categoria","Aurum Score","Potência estimada (kWp)","Geração anual (kWh)","Endereço"]].head(10),
-            use_container_width=True
-        )
+        params = st.session_state.last_params or {}
+        if params.get("volume_mode"):
+            st.dataframe(
+                df[["Nome","Categoria","Latitude","Longitude","Endereço"]].head(10),
+                use_container_width=True
+            )
+        else:
+            st.dataframe(
+                df[["Nome","Categoria","Aurum Score","Potência estimada (kWp)","Geração anual (kWh)","Endereço"]].head(10),
+                use_container_width=True
+            )
 
 # ---------- Mapeamento atual ----------
 with tab_map:
