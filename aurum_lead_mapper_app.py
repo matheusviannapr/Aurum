@@ -8,7 +8,7 @@
 # - Aba "Maiores Telhados" com persistência (sem “pisca e some”)
 
 import os, math, time, json
-from typing import List, Dict
+from typing import List, Dict, Optional, Set, Tuple
 import pandas as pd
 import requests
 import streamlit as st
@@ -1778,6 +1778,27 @@ def google_place_details(place_id: str, api_key: str) -> Dict:
     except Exception:
         return {}
 
+def lead_key(name: Optional[str], lat: Optional[float], lon: Optional[float]) -> Optional[Tuple[float, float, str]]:
+    if name is None or lat is None or lon is None:
+        return None
+    try:
+        return (round(float(lat), 6), round(float(lon), 6), str(name).strip().lower())
+    except Exception:
+        return None
+
+def build_saved_lead_keys(saved_leads: Optional[pd.DataFrame]) -> Set[Tuple[float, float, str]]:
+    if saved_leads is None or saved_leads.empty:
+        return set()
+    required_cols = {"Nome", "Latitude", "Longitude"}
+    if not required_cols.issubset(saved_leads.columns):
+        return set()
+    keys = set()
+    for _, row in saved_leads.iterrows():
+        k = lead_key(row.get("Nome"), row.get("Latitude"), row.get("Longitude"))
+        if k is not None:
+            keys.add(k)
+    return keys
+
 # ================== Título / Sidebar ==================
 st.title("⚡ Aurum Lead Mapper — prospecção geointeligente")
 st.caption("Overpass POI • Google Nearby + Text • Details • Dashboard • CRM • Maiores Telhados")
@@ -1859,7 +1880,9 @@ if run_btn:
 
     keys = [k.strip() for k in keywords.split(",") if k.strip()]
     per_kw = per_kw_limit
-    seen, results = set(), []
+    saved_keys = build_saved_lead_keys(st.session_state.saved_leads)
+    seen, results = set(saved_keys), []
+    skipped_saved = 0
 
     total_steps = max(1,
         (1 if use_osm else 0) +
@@ -1884,8 +1907,8 @@ if run_btn:
                     name = tags.get("name") or tags.get("addr:housename")
                     if not name:
                         name = "Residência" if classification["category"] == "Residencial / Indefinido" else f"Edificação {d.get('id')}"
-                    k = (round(d["lat"], 6), round(d["lon"], 6), name)
-                    if k not in seen:
+                    k = lead_key(name, d["lat"], d["lon"])
+                    if k and k not in seen:
                         seen.add(k)
                         results.append({
                             "name": name,
@@ -1901,14 +1924,19 @@ if run_btn:
                             "email": tags.get("contact:email") or tags.get("email"),
                             "category": classification["category"],
                         })
+                    elif k in saved_keys:
+                        skipped_saved += 1
             else:
                 data = overpass_poi_search(lat0, lon0, radius_m, category, limit=max_results)
                 for d in data:
                     if len(results) >= max_results:
                         break
-                    k = (round(d["lat"],6), round(d["lon"],6), d["name"])
-                    if k not in seen:
-                        seen.add(k); results.append(d)
+                    k = lead_key(d.get("name"), d.get("lat"), d.get("lon"))
+                    if k and k not in seen:
+                        seen.add(k)
+                        results.append(d)
+                    elif k in saved_keys:
+                        skipped_saved += 1
         except Exception as e:
             st.warning(f"OSM POI falhou: {e}")
         steps_done += 1; prog.progress(min(1.0, steps_done / total_steps))
@@ -1925,9 +1953,13 @@ if run_btn:
                 for d in data:
                     if len(results) >= max_results:
                         break
-                    k = (round(d["lat"],6), round(d["lon"],6), d["name"])
-                    if k not in seen:
-                        d["category"] = category; seen.add(k); results.append(d)
+                    k = lead_key(d.get("name"), d.get("lat"), d.get("lon"))
+                    if k and k not in seen:
+                        d["category"] = category
+                        seen.add(k)
+                        results.append(d)
+                    elif k in saved_keys:
+                        skipped_saved += 1
             except Exception as e:
                 st.warning(f"Google Nearby falhou ({gtype}): {e}")
             steps_done += 1; prog.progress(min(1.0, steps_done / total_steps))
@@ -1946,9 +1978,13 @@ if run_btn:
                 for d in data:
                     if len(results) >= max_results:
                         break
-                    k = (round(d["lat"],6), round(d["lon"],6), d["name"])
-                    if k not in seen:
-                        d["category"] = category; seen.add(k); results.append(d)
+                    k = lead_key(d.get("name"), d.get("lat"), d.get("lon"))
+                    if k and k not in seen:
+                        d["category"] = category
+                        seen.add(k)
+                        results.append(d)
+                    elif k in saved_keys:
+                        skipped_saved += 1
             except Exception as e:
                 st.warning(f"Google Text falhou ('{kw}'): {e}")
             steps_done += 1; prog.progress(min(1.0, steps_done / total_steps))
@@ -1982,14 +2018,19 @@ if run_btn:
             for d in extra:
                 if len(results) >= max_results:
                     break
-                k = (round(d["lat"],6), round(d["lon"],6), d["name"])
-                if k not in seen:
-                    seen.add(k); results.append(d)
+                k = lead_key(d.get("name"), d.get("lat"), d.get("lon"))
+                if k and k not in seen:
+                    seen.add(k)
+                    results.append(d)
+                elif k in saved_keys:
+                    skipped_saved += 1
         except Exception as e:
             st.warning(f"Nominatim extra falhou: {e}")
         steps_done += 1; prog.progress(min(1.0, steps_done / total_steps))
 
     st.write(f"🧭 Locais encontrados (deduplicados): **{len(results)}**")
+    if saved_keys:
+        st.caption(f"⏭️ Ignorados por já estarem salvos: **{skipped_saved}**")
 
     # Diagnóstico de fontes
     src_count = Counter([r.get("source","?") for r in results])
