@@ -15,12 +15,10 @@ import logging
 import math
 import os
 import random
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -711,6 +709,12 @@ def write_report(
     failed_tiles: List[Tuple[float, float, float, float]],
 ) -> None:
     total_time = time.time() - stats.start_time
+    total_elements = max(stats.total_elements, 1)
+
+    def fmt_count(value: int) -> str:
+        pct = (value / total_elements) * 100
+        return f"{value} ({pct:.2f}%)"
+
     report_path = os.path.join(config.out_dir, "report.md")
     with open(report_path, "w", encoding="utf-8") as handle:
         handle.write("# Roof Candidate Report\n\n")
@@ -722,14 +726,16 @@ def write_report(
         handle.write(f"Total elements fetched: {stats.total_elements}\n\n")
         handle.write(f"Tiles fetched: {stats.fetched_tiles}\n\n")
         handle.write(f"Tiles failed: {stats.failed_tiles}\n\n")
-        handle.write(f"Discarded invalid geometry: {stats.discarded_invalid}\n\n")
-        handle.write(f"Discarded solar tags: {stats.discarded_solar}\n\n")
-        handle.write(f"Discarded excluded building: {stats.discarded_excluded_building}\n\n")
-        handle.write(f"Discarded target mismatch: {stats.discarded_target}\n\n")
-        handle.write(f"Deduplicated removed: {stats.dedup_removed}\n\n")
+        handle.write(f"Discarded invalid geometry: {fmt_count(stats.discarded_invalid)}\n\n")
+        handle.write(f"Discarded solar tags: {fmt_count(stats.discarded_solar)}\n\n")
+        handle.write(
+            f"Discarded excluded building: {fmt_count(stats.discarded_excluded_building)}\n\n"
+        )
+        handle.write(f"Discarded target mismatch: {fmt_count(stats.discarded_target)}\n\n")
+        handle.write(f"Deduplicated removed: {fmt_count(stats.dedup_removed)}\n\n")
         handle.write("### Geometry filter removals\n")
         for reason, count in stats.discarded_geometry_filter.items():
-            handle.write(f"- {reason}: {count}\n")
+            handle.write(f"- {reason}: {fmt_count(count)}\n")
         handle.write("\n")
         handle.write("## Timing\n")
         for stage, duration in stats.stage_times.items():
@@ -839,8 +845,18 @@ def main() -> None:
     if config.tile_size_deg <= 0:
         raise SystemExit("tile_size_deg must be > 0")
 
-    tiles = tile_bounds(bounds, config.tile_size_deg)
-    if len(tiles) > 5000:
+    tile_size = config.tile_size_deg
+    tiles = tile_bounds(bounds, tile_size)
+    if len(tiles) > 8000:
+        scale = math.sqrt(len(tiles) / 8000)
+        tile_size = round(tile_size * scale, 5)
+        tiles = tile_bounds(bounds, tile_size)
+        logging.warning(
+            "Large tile count detected (%s). Adjusting tile_size_deg to %s.",
+            len(tiles),
+            tile_size,
+        )
+    elif len(tiles) > 5000:
         logging.warning("Large tile count detected: %s", len(tiles))
 
     client = OverpassClient(config.timeout_s, config.cache_dir, RateLimiter())
