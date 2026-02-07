@@ -1,11 +1,8 @@
-#!/usr/bin/env python3
-"""main.py
-# Instalação:
-#   python3 -m venv .venv && source .venv/bin/activate
-#   pip install requests shapely pyproj geopandas pandas numpy
-# Execução:
+# Installation:
+#   python -m pip install requests shapely pyproj geopandas pandas numpy
+# Run:
 #   python main.py --bbox "minLon,minLat,maxLon,maxLat" --out_dir ./out
-"""
+#   python main.py --aoi path.geojson --out_dir ./out
 
 from __future__ import annotations
 
@@ -18,28 +15,22 @@ import logging
 import math
 import os
 import random
-import sys
 import threading
 import time
-from collections import Counter, defaultdict
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 import requests
-from shapely.geometry import MultiPolygon, Polygon, box, shape
-from shapely.ops import polygonize, transform
-from shapely.strtree import STRtree
-from shapely.validation import make_valid
 from pyproj import CRS, Transformer
-import geopandas as gpd
+from shapely import geometry as geom
+from shapely.ops import transform, unary_union
+from shapely.validation import make_valid
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
-PRIORITY_BUILDINGS = {
+OVERPASS_URL = os.environ.get("OVERPASS_URL", "https://overpass-api.de/api/interpreter")
+
+PREFERRED_BUILDINGS = {
     "industrial",
     "warehouse",
     "commercial",
@@ -51,25 +42,16 @@ PRIORITY_BUILDINGS = {
     "hospital",
 }
 
-EXCLUDE_BUILDINGS = {
-    "hut",
-    "shed",
-    "garage",
-    "kiosk",
-    "terrace",
-    "cabin",
-    "roof",
-}
+EXCLUDED_BUILDINGS = {"hut", "shed", "garage", "kiosk", "terrace", "cabin", "roof"}
 
 RESIDENTIAL_BUILDINGS = {
-    "house",
     "residential",
+    "house",
     "apartments",
     "detached",
     "semidetached_house",
     "terrace",
     "bungalow",
-    "hut",
 }
 
 SOLAR_TAG_KEYS = {
@@ -82,44 +64,45 @@ SOLAR_TAG_KEYS = {
     "roof:solar",
 }
 
-RELEVANT_TAG_KEYS = {
-    "building",
-    "building:part",
-    "name",
-    "roof:shape",
-    "roof:direction",
-    "roof:orientation",
-    "roof:material",
-    "building:levels",
-    "height",
-}
+SOLAR_TAG_VALUES = {"solar", "photovoltaic", "yes", "true"}
 
 ORIENTATION_MAP = {
     "N": 0,
-    "NNE": 22.5,
     "NE": 45,
-    "ENE": 67.5,
     "E": 90,
-    "ESE": 112.5,
     "SE": 135,
-    "SSE": 157.5,
     "S": 180,
-    "SSW": 202.5,
     "SW": 225,
-    "WSW": 247.5,
     "W": 270,
-    "WNW": 292.5,
     "NW": 315,
-    "NNW": 337.5,
 }
 
 
 @dataclass
-class Candidate:
-    osm_id: str
-    osm_type: str
-    geometry: Polygon
-    tags: Dict[str, Any]
+class Config:
+    aoi_path: Optional[str]
+    bbox: Optional[Tuple[float, float, float, float]]
+    min_area_m2: float
+    target: str
+    tile_size_deg: float
+    max_candidates: int
+    out_dir: str
+    strict: bool
+    workers: int
+    timeout_s: int
+    cache_dir: str
+    seed: int
+
+
+@dataclass
+class TileResult:
+    elements: List[Dict[str, Any]]
+    failed: bool = False
+    error: Optional[str] = None
+
+
+@dataclass
+class Metrics:
     area_m2: float
     perimeter_m: float
     compactness: float
@@ -129,291 +112,425 @@ class Candidate:
     vertex_count: int
     hole_area_ratio: float
     min_width_m: float
+
+
+@dataclass
+class Candidate:
+    osm_id: str
+    osm_type: str
+    geometry: geom.base.BaseGeometry
+    tags: Dict[str, Any]
+    metrics: Metrics
     orientation_deg: Optional[float]
     orientation_confidence: str
-    solar_status: str
-    centroid_lat: float
-    centroid_lon: float
     score: float
+    solar_status: str
+    centroid_lon: float
+    centroid_lat: float
+
+
+@dataclass
+class Stats:
+    total_elements: int = 0
+    fetched_tiles: int = 0
+    failed_tiles: int = 0
+    discarded_invalid: int = 0
+    discarded_solar: int = 0
+    discarded_excluded_building: int = 0
+    discarded_geometry_filter: Dict[str, int] = field(default_factory=dict)
+    discarded_target: int = 0
+    dedup_removed: int = 0
+    start_time: float = field(default_factory=time.time)
+    stage_times: Dict[str, float] = field(default_factory=dict)
+
+    def inc_reason(self, key: str, count: int = 1) -> None:
+        self.discarded_geometry_filter[key] = self.discarded_geometry_filter.get(key, 0) + count
 
 
 class RateLimiter:
     def __init__(self, min_interval_s: float = 1.0) -> None:
         self.min_interval_s = min_interval_s
         self.lock = threading.Lock()
-        self.last_time = 0.0
+        self.last_call = 0.0
 
     def wait(self) -> None:
         with self.lock:
             now = time.time()
-            elapsed = now - self.last_time
+            elapsed = now - self.last_call
             if elapsed < self.min_interval_s:
                 time.sleep(self.min_interval_s - elapsed)
-            self.last_time = time.time()
+            self.last_call = time.time()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Identify rooftop candidates from OSM/Overpass")
-    parser.add_argument("--aoi", type=str, help="Path to AOI geojson")
-    parser.add_argument("--bbox", type=str, help='"minLon,minLat,maxLon,maxLat"')
+class OverpassClient:
+    def __init__(self, timeout_s: int, cache_dir: str, rate_limiter: RateLimiter) -> None:
+        self.timeout_s = timeout_s
+        self.cache_dir = cache_dir
+        self.rate_limiter = rate_limiter
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    def _cache_path(self, query: str) -> str:
+        digest = hashlib.md5(query.encode("utf-8")).hexdigest()
+        return os.path.join(self.cache_dir, f"{digest}.json")
+
+    def fetch(self, query: str) -> Dict[str, Any]:
+        cache_path = self._cache_path(query)
+        if os.path.exists(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+
+        backoff = 2.0
+        for attempt in range(6):
+            try:
+                self.rate_limiter.wait()
+                response = requests.post(
+                    OVERPASS_URL,
+                    data=query.encode("utf-8"),
+                    timeout=self.timeout_s,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+                if response.status_code in {429, 504}:
+                    raise requests.HTTPError(f"{response.status_code} {response.text}")
+                response.raise_for_status()
+                payload = response.json()
+                with open(cache_path, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle)
+                return payload
+            except (requests.Timeout, requests.HTTPError, requests.ConnectionError) as exc:
+                logging.warning("Overpass request failed (attempt %s): %s", attempt + 1, exc)
+                if attempt == 5:
+                    raise
+                time.sleep(backoff)
+                backoff *= 2
+        raise RuntimeError("Overpass fetch failed after retries")
+
+
+def parse_args() -> Config:
+    parser = argparse.ArgumentParser(description="Roof candidate identification via OSM/Overpass")
+    parser.add_argument("--aoi", dest="aoi_path", help="Path to AOI GeoJSON")
+    parser.add_argument("--bbox", help="minLon,minLat,maxLon,maxLat")
     parser.add_argument("--min_area_m2", type=float, default=300)
-    parser.add_argument("--target", type=str, choices=["commercial", "industrial", "mixed"], default="mixed")
+    parser.add_argument("--target", choices=["commercial", "industrial", "mixed"], default="mixed")
     parser.add_argument("--tile_size_deg", type=float, default=0.01)
     parser.add_argument("--max_candidates", type=int, default=3000)
-    parser.add_argument("--out_dir", type=str, default="./out")
+    parser.add_argument("--out_dir", default="./out")
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--timeout_s", type=int, default=180)
-    parser.add_argument("--cache_dir", type=str, default="./.cache_overpass")
+    parser.add_argument("--cache_dir", default="./.cache_overpass")
     parser.add_argument("--seed", type=int, default=42)
-    return parser.parse_args()
 
+    args = parser.parse_args()
 
-def load_aoi_geometry(args: argparse.Namespace) -> Polygon:
-    if args.aoi:
-        gdf = gpd.read_file(args.aoi)
-        geom = gdf.geometry.unary_union
-        if isinstance(geom, MultiPolygon):
-            geom = max(geom.geoms, key=lambda g: g.area)
-        if not isinstance(geom, Polygon):
-            raise ValueError("AOI geometry must be polygonal")
-        return geom
+    bbox = None
     if args.bbox:
-        parts = [float(x.strip()) for x in args.bbox.split(",")]
-        if len(parts) != 4:
-            raise ValueError("bbox must have 4 comma-separated values")
-        min_lon, min_lat, max_lon, max_lat = parts
-        return box(min_lon, min_lat, max_lon, max_lat)
-    raise ValueError("Either --aoi or --bbox must be provided")
+        try:
+            parts = [float(p) for p in args.bbox.split(",")]
+            if len(parts) != 4:
+                raise ValueError
+            bbox = (parts[0], parts[1], parts[2], parts[3])
+        except ValueError:
+            raise SystemExit("Invalid --bbox format. Use minLon,minLat,maxLon,maxLat")
 
+    if not args.aoi_path and not bbox:
+        raise SystemExit("Provide --aoi or --bbox")
 
-def build_tiles(aoi: Polygon, tile_size_deg: float) -> List[Polygon]:
-    minx, miny, maxx, maxy = aoi.bounds
-    tiles: List[Polygon] = []
-    x = minx
-    while x < maxx:
-        y = miny
-        while y < maxy:
-            tile = box(x, y, min(x + tile_size_deg, maxx), min(y + tile_size_deg, maxy))
-            if tile.intersects(aoi):
-                tiles.append(tile)
-            y += tile_size_deg
-        x += tile_size_deg
-    return tiles
-
-
-def adapt_tile_size(aoi: Polygon, tile_size_deg: float) -> float:
-    tiles = build_tiles(aoi, tile_size_deg)
-    if len(tiles) <= 2000:
-        return tile_size_deg
-    factor = math.sqrt(len(tiles) / 2000)
-    return tile_size_deg * factor
-
-
-def build_query(tile: Polygon, timeout_s: int) -> str:
-    minx, miny, maxx, maxy = tile.bounds
-    return (
-        f"[out:json][timeout:{timeout_s}];("
-        f"way[\"building\"]({miny},{minx},{maxy},{maxx});"
-        f"relation[\"building\"]({miny},{minx},{maxy},{maxx});"
-        f"way[\"building:part\"]({miny},{minx},{maxy},{maxx});"
-        f"relation[\"building:part\"]({miny},{minx},{maxy},{maxx});"
-        ");out body geom;"
+    return Config(
+        aoi_path=args.aoi_path,
+        bbox=bbox,
+        min_area_m2=args.min_area_m2,
+        target=args.target,
+        tile_size_deg=args.tile_size_deg,
+        max_candidates=args.max_candidates,
+        out_dir=args.out_dir,
+        strict=args.strict,
+        workers=args.workers,
+        timeout_s=args.timeout_s,
+        cache_dir=args.cache_dir,
+        seed=args.seed,
     )
 
 
-def query_overpass(
-    query: str,
-    cache_dir: Path,
-    rate_limiter: RateLimiter,
-    timeout_s: int,
-) -> Dict[str, Any]:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    q_hash = hashlib.md5(query.encode("utf-8")).hexdigest()
-    cache_file = cache_dir / f"{q_hash}.json"
-    if cache_file.exists():
-        with cache_file.open("r", encoding="utf-8") as f:
-            return json.load(f)
-
-    backoff = 2
-    for attempt in range(5):
-        try:
-            rate_limiter.wait()
-            response = requests.post(OVERPASS_URL, data=query, timeout=timeout_s)
-            if response.status_code in {429, 504}:
-                raise requests.HTTPError(f"{response.status_code} rate limit")
-            response.raise_for_status()
-            data = response.json()
-            with cache_file.open("w", encoding="utf-8") as f:
-                json.dump(data, f)
-            return data
-        except (requests.Timeout, requests.HTTPError, requests.ConnectionError) as exc:
-            logging.warning("Overpass error (attempt %s): %s", attempt + 1, exc)
-            time.sleep(backoff)
-            backoff *= 2
-    raise RuntimeError("Overpass failed after retries")
+def load_aoi(config: Config) -> Tuple[geom.base.BaseGeometry, Tuple[float, float, float, float]]:
+    if config.aoi_path:
+        with open(config.aoi_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if data.get("type") == "FeatureCollection":
+            shapes = [geom.shape(feature["geometry"]) for feature in data["features"]]
+            polygon = unary_union(shapes)
+        elif data.get("type") == "Feature":
+            polygon = geom.shape(data["geometry"])
+        else:
+            polygon = geom.shape(data)
+        polygon = polygon.buffer(0)
+        return polygon, polygon.bounds
+    min_lon, min_lat, max_lon, max_lat = config.bbox
+    polygon = geom.box(min_lon, min_lat, max_lon, max_lat)
+    return polygon, (min_lon, min_lat, max_lon, max_lat)
 
 
-def has_solar_tags(tags: Dict[str, Any]) -> bool:
+def tile_bounds(bounds: Tuple[float, float, float, float], tile_size_deg: float) -> List[Tuple[float, float, float, float]]:
+    min_lon, min_lat, max_lon, max_lat = bounds
+    tiles = []
+    lon = min_lon
+    while lon < max_lon:
+        lat = min_lat
+        next_lon = min(lon + tile_size_deg, max_lon)
+        while lat < max_lat:
+            next_lat = min(lat + tile_size_deg, max_lat)
+            tiles.append((lon, lat, next_lon, next_lat))
+            lat = next_lat
+        lon = next_lon
+    return tiles
+
+
+def build_query(tile: Tuple[float, float, float, float], timeout_s: int) -> str:
+    min_lon, min_lat, max_lon, max_lat = tile
+    bbox = f"{min_lat},{min_lon},{max_lat},{max_lon}"
+    query = (
+        f"[out:json][timeout:{timeout_s}];("
+        f"way[\"building\"]({bbox});"
+        f"way[\"building:part\"]({bbox});"
+        f"relation[\"building\"]({bbox});"
+        f"relation[\"building:part\"]({bbox});" 
+        f");out body geom;"
+    )
+    return query
+
+
+def fetch_tile(client: OverpassClient, tile: Tuple[float, float, float, float], timeout_s: int) -> TileResult:
+    query = build_query(tile, timeout_s)
+    try:
+        payload = client.fetch(query)
+        elements = payload.get("elements", [])
+        return TileResult(elements=elements)
+    except Exception as exc:  # noqa: BLE001
+        return TileResult(elements=[], failed=True, error=str(exc))
+
+
+def sanitize_tags(tags: Dict[str, Any]) -> Dict[str, Any]:
+    keep_keys = {
+        "building",
+        "building:part",
+        "name",
+        "roof:shape",
+        "roof:direction",
+        "roof:orientation",
+        "roof:material",
+        "building:levels",
+        "height",
+    }
+    for key in list(tags.keys()):
+        if key.startswith("addr:"):
+            keep_keys.add(key)
+    return {k: tags.get(k) for k in keep_keys if k in tags}
+
+
+def has_solar(tags: Dict[str, Any]) -> bool:
     for key, value in tags.items():
-        key_lower = key.lower()
-        if key_lower in SOLAR_TAG_KEYS:
-            if key_lower == "generator:source" and str(value).lower() == "solar":
+        if key in SOLAR_TAG_KEYS:
+            if isinstance(value, str) and value.lower() in SOLAR_TAG_VALUES:
                 return True
-            if key_lower == "generator:method" and str(value).lower() == "photovoltaic":
+            if key in {"rooftop:solar", "roof:solar"}:
                 return True
-            if key_lower == "power" and str(value).lower() == "generator" and str(tags.get("generator:source", "")).lower() == "solar":
-                return True
-            if key_lower in {"solar_panel", "solar_panels"} and str(value).lower() in {"yes", "true", "1"}:
-                return True
-            if key_lower in {"rooftop:solar", "roof:solar"}:
-                return True
+        if key in {"solar_panel", "solar_panels"} and str(value).lower() in SOLAR_TAG_VALUES:
+            return True
+    if tags.get("power") == "generator" and tags.get("generator:source") == "solar":
+        return True
     return False
 
 
-def parse_way_geometry(geom_list: List[Dict[str, float]]) -> Optional[Polygon]:
-    if not geom_list:
-        return None
-    coords = [(pt["lon"], pt["lat"]) for pt in geom_list]
-    if len(coords) < 4:
-        return None
-    if coords[0] != coords[-1]:
-        coords.append(coords[0])
-    return Polygon(coords)
+def element_to_geometry(element: Dict[str, Any]) -> Optional[geom.base.BaseGeometry]:
+    if "geometry" in element:
+        coords = [(p["lon"], p["lat"]) for p in element["geometry"]]
+        if len(coords) < 3:
+            return None
+        if coords[0] != coords[-1]:
+            coords.append(coords[0])
+        return geom.Polygon(coords)
+    if element.get("type") == "relation":
+        members = element.get("members", [])
+        outers = []
+        inners = []
+        for member in members:
+            if "geometry" not in member:
+                continue
+            coords = [(p["lon"], p["lat"]) for p in member["geometry"]]
+            if len(coords) < 3:
+                continue
+            if coords[0] != coords[-1]:
+                coords.append(coords[0])
+            ring = geom.LinearRing(coords)
+            if member.get("role") == "inner":
+                inners.append(ring)
+            else:
+                outers.append(ring)
+        if not outers:
+            return None
+        polygons = []
+        for outer in outers:
+            inner_rings = [inner for inner in inners if inner.within(geom.Polygon(outer))]
+            polygons.append(geom.Polygon(outer, inner_rings))
+        if len(polygons) == 1:
+            return polygons[0]
+        return geom.MultiPolygon(polygons)
+    return None
 
 
-def parse_relation_geometry(members: List[Dict[str, Any]]) -> Optional[Polygon]:
-    outer_lines = []
-    inner_lines = []
-    for member in members:
-        if member.get("type") != "way" or "geometry" not in member:
-            continue
-        coords = [(pt["lon"], pt["lat"]) for pt in member["geometry"]]
-        if len(coords) < 4:
-            continue
-        if member.get("role") == "inner":
-            inner_lines.append(coords)
-        else:
-            outer_lines.append(coords)
-    if not outer_lines:
-        return None
-    outer_polys = list(polygonize(outer_lines))
-    if not outer_polys:
-        return None
-    if inner_lines:
-        inners = list(polygonize(inner_lines))
-        if inners:
-            holes = [poly.exterior.coords[:] for poly in inners]
-            poly = Polygon(outer_polys[0].exterior.coords, holes=holes)
-            return poly
-    return outer_polys[0]
-
-
-def collect_elements(data: Dict[str, Any]) -> List[Tuple[str, str, Dict[str, Any], Polygon]]:
-    elements = []
-    for el in data.get("elements", []):
-        tags = el.get("tags", {})
-        if not tags:
-            continue
-        osm_type = el.get("type")
-        osm_id = str(el.get("id"))
-        geom = None
-        if osm_type == "way":
-            geom = parse_way_geometry(el.get("geometry", []))
-        elif osm_type == "relation":
-            geom = parse_relation_geometry(el.get("members", []))
-        if geom is None:
-            continue
-        elements.append((osm_id, osm_type, tags, geom))
-    return elements
-
-
-def is_building_candidate(tags: Dict[str, Any]) -> bool:
-    building = tags.get("building") or tags.get("building:part")
-    if not building:
-        return False
-    building = str(building).lower()
-    if building in EXCLUDE_BUILDINGS:
-        return False
-    if building in PRIORITY_BUILDINGS:
-        return True
-    if building == "yes":
-        return True
-    return True
-
-
-def tags_subset(tags: Dict[str, Any]) -> Dict[str, Any]:
-    subset = {k: v for k, v in tags.items() if k in RELEVANT_TAG_KEYS or k.startswith("addr:")}
-    building = tags.get("building")
-    if building:
-        subset["building"] = building
-    building_part = tags.get("building:part")
-    if building_part:
-        subset["building:part"] = building_part
-    return subset
-
-
-def utm_crs_for_lon_lat(lon: float, lat: float) -> CRS:
+def get_utm_crs(lon: float, lat: float) -> CRS:
     zone = int((lon + 180) / 6) + 1
-    if lat >= 0:
-        return CRS.from_epsg(32600 + zone)
-    return CRS.from_epsg(32700 + zone)
+    epsg = 32600 + zone if lat >= 0 else 32700 + zone
+    return CRS.from_epsg(epsg)
 
 
-def compute_metrics(geom: Polygon) -> Optional[Dict[str, float]]:
-    if geom.is_empty:
+def project_geometry(geometry: geom.base.BaseGeometry) -> geom.base.BaseGeometry:
+    centroid = geometry.centroid
+    utm = get_utm_crs(centroid.x, centroid.y)
+    transformer = Transformer.from_crs("EPSG:4326", utm, always_xy=True)
+    return transform(transformer.transform, geometry)
+
+
+def compute_metrics(geometry: geom.base.BaseGeometry) -> Optional[Metrics]:
+    if geometry.is_empty:
         return None
-    geom = make_valid(geom)
-    if geom.is_empty or not geom.is_valid:
+    try:
+        geometry = make_valid(geometry)
+    except Exception:  # noqa: BLE001
+        geometry = geometry.buffer(0)
+    if not geometry.is_valid or geometry.is_empty:
         return None
-    if isinstance(geom, MultiPolygon):
-        geom = max(geom.geoms, key=lambda g: g.area)
-    centroid = geom.centroid
-    transformer = Transformer.from_crs("EPSG:4326", utm_crs_for_lon_lat(centroid.x, centroid.y), always_xy=True)
-    geom_m = transform(transformer.transform, geom)
-    if geom_m.is_empty or not geom_m.is_valid:
+
+    projected = project_geometry(geometry)
+    if projected.is_empty:
         return None
-    area = geom_m.area
-    perimeter = geom_m.length
+
+    area = projected.area
+    perimeter = projected.length
     if perimeter == 0:
         return None
-    compactness = 4 * math.pi * area / (perimeter**2)
-    convex_area = geom_m.convex_hull.area
-    convexity = area / convex_area if convex_area else 0
-    min_rect = geom_m.minimum_rotated_rectangle
-    rect_area = min_rect.area
-    rectangularity = area / rect_area if rect_area else 0
-    rect_coords = list(min_rect.exterior.coords)
-    if len(rect_coords) < 4:
+    compactness = 4 * math.pi * area / (perimeter * perimeter)
+    convex_hull = projected.convex_hull
+    convexity = area / convex_hull.area if convex_hull.area else 0.0
+
+    min_rect = projected.minimum_rotated_rectangle
+    rect_area = min_rect.area if min_rect.area else 0.0
+    rectangularity = area / rect_area if rect_area else 0.0
+
+    coords = list(min_rect.exterior.coords)
+    edges = [geom.LineString([coords[i], coords[i + 1]]) for i in range(4)]
+    lengths = sorted([edge.length for edge in edges if edge.length > 0])
+    if len(lengths) < 2:
         return None
-    edge_lengths = [
-        math.dist(rect_coords[i], rect_coords[i + 1]) for i in range(len(rect_coords) - 1)
-    ]
-    edge_lengths = sorted(edge_lengths, reverse=True)
-    length = edge_lengths[0]
-    width = edge_lengths[1] if len(edge_lengths) > 1 else edge_lengths[0]
-    aspect_ratio = length / width if width else 0
-    vertex_count = len(geom_m.exterior.coords)
-    hole_area = sum(Polygon(ring).area for ring in geom_m.interiors)
-    hole_area_ratio = hole_area / area if area else 0
-    min_width = min(length, width)
-    return {
-        "area_m2": area,
-        "perimeter_m": perimeter,
-        "compactness": compactness,
-        "convexity": convexity,
-        "rectangularity": rectangularity,
-        "aspect_ratio": aspect_ratio,
-        "vertex_count": vertex_count,
-        "hole_area_ratio": hole_area_ratio,
-        "min_width_m": min_width,
-        "centroid_lat": centroid.y,
-        "centroid_lon": centroid.x,
-    }
+    width, height = lengths[0], lengths[-1]
+    aspect_ratio = height / width if width else 0.0
+
+    vertex_count = len(projected.exterior.coords) if hasattr(projected, "exterior") else 0
+    hole_area = 0.0
+    if hasattr(projected, "interiors"):
+        for ring in projected.interiors:
+            hole_area += geom.Polygon(ring).area
+    hole_area_ratio = hole_area / area if area else 0.0
+
+    return Metrics(
+        area_m2=area,
+        perimeter_m=perimeter,
+        compactness=compactness,
+        convexity=convexity,
+        rectangularity=rectangularity,
+        aspect_ratio=aspect_ratio,
+        vertex_count=vertex_count,
+        hole_area_ratio=hole_area_ratio,
+        min_width_m=width,
+    )
 
 
-def filter_geometry(metrics: Dict[str, float], min_area_m2: float, strict: bool) -> Optional[str]:
+def orientation_from_tags(tags: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    direction = tags.get("roof:direction")
+    if direction is not None:
+        try:
+            return float(direction) % 360, "high"
+        except ValueError:
+            pass
+    orientation = tags.get("roof:orientation")
+    if orientation:
+        orientation = orientation.upper()
+        if orientation in ORIENTATION_MAP:
+            return float(ORIENTATION_MAP[orientation]), "high"
+    return None, "none"
+
+
+def orientation_from_geometry(geometry: geom.base.BaseGeometry) -> Optional[float]:
+    projected = project_geometry(geometry)
+    min_rect = projected.minimum_rotated_rectangle
+    coords = list(min_rect.exterior.coords)
+    if len(coords) < 4:
+        return None
+    edge = geom.LineString([coords[0], coords[1]])
+    dx = coords[1][0] - coords[0][0]
+    dy = coords[1][1] - coords[0][1]
+    if edge.length == 0:
+        return None
+    angle = math.degrees(math.atan2(dy, dx))
+    angle = (angle + 360) % 180
+    return angle
+
+
+def orientation_score(angle: Optional[float], confidence: str) -> float:
+    if angle is None:
+        return 4.0
+    north = angle >= 315 or angle <= 45
+    south = 135 <= angle <= 225
+    if confidence == "high":
+        if north:
+            return 10.0
+        if south:
+            return 2.0
+        return 6.0
+    if confidence == "low":
+        if north:
+            return 6.0
+        if south:
+            return 1.0
+        return 4.0
+    return 4.0
+
+
+def geometry_score(metrics: Metrics) -> float:
+    scores = []
+    scores.append(np.clip(metrics.compactness / 0.4, 0, 1))
+    scores.append(np.clip(metrics.convexity / 1.0, 0, 1))
+    scores.append(np.clip(metrics.rectangularity / 1.0, 0, 1))
+    aspect = np.clip((8 - metrics.aspect_ratio) / 8, 0, 1)
+    scores.append(aspect)
+    hole_score = np.clip((0.15 - metrics.hole_area_ratio) / 0.15, 0, 1)
+    scores.append(hole_score)
+    width_score = np.clip((metrics.min_width_m - 4) / 6, 0, 1)
+    scores.append(width_score)
+    return float(np.mean(scores) * 45)
+
+
+def area_score(area_m2: float, base: float = 300, cap: float = 2000) -> float:
+    if area_m2 <= base:
+        return 0.0
+    if area_m2 >= cap:
+        return 40.0
+    return float(((area_m2 - base) / (cap - base)) * 40)
+
+
+def tag_confidence_score(tags: Dict[str, Any]) -> float:
+    score = 0.0
+    building = tags.get("building")
+    if building in PREFERRED_BUILDINGS:
+        score += 2.0
+    if any(key.startswith("roof:") for key in tags.keys()):
+        score += 3.0
+    return score
+
+
+def filter_metrics(metrics: Metrics, config: Config, stats: Stats) -> bool:
+    strict = config.strict
     thresholds = {
+        "area_m2": config.min_area_m2,
         "compactness": 0.20 if strict else 0.15,
         "convexity": 0.82 if strict else 0.75,
         "rectangularity": 0.70 if strict else 0.60,
@@ -422,361 +539,366 @@ def filter_geometry(metrics: Dict[str, float], min_area_m2: float, strict: bool)
         "hole_area_ratio": 0.08 if strict else 0.15,
         "min_width_m": 5 if strict else 4,
     }
-    if metrics["area_m2"] < min_area_m2:
-        return "area_m2"
-    if metrics["compactness"] < thresholds["compactness"]:
-        return "compactness"
-    if metrics["convexity"] < thresholds["convexity"]:
-        return "convexity"
-    if metrics["rectangularity"] < thresholds["rectangularity"]:
-        return "rectangularity"
-    if metrics["aspect_ratio"] > thresholds["aspect_ratio"]:
-        return "aspect_ratio"
-    if metrics["vertex_count"] > thresholds["vertex_count"]:
-        return "vertex_count"
-    if metrics["hole_area_ratio"] > thresholds["hole_area_ratio"]:
-        return "hole_area_ratio"
-    if metrics["min_width_m"] < thresholds["min_width_m"]:
-        return "min_width_m"
-    return None
+
+    if metrics.area_m2 < thresholds["area_m2"]:
+        stats.inc_reason("area_m2")
+        return False
+    if metrics.compactness < thresholds["compactness"]:
+        stats.inc_reason("compactness")
+        return False
+    if metrics.convexity < thresholds["convexity"]:
+        stats.inc_reason("convexity")
+        return False
+    if metrics.rectangularity < thresholds["rectangularity"]:
+        stats.inc_reason("rectangularity")
+        return False
+    if metrics.aspect_ratio > thresholds["aspect_ratio"]:
+        stats.inc_reason("aspect_ratio")
+        return False
+    if metrics.vertex_count > thresholds["vertex_count"]:
+        stats.inc_reason("vertex_count")
+        return False
+    if metrics.hole_area_ratio > thresholds["hole_area_ratio"]:
+        stats.inc_reason("hole_area_ratio")
+        return False
+    if metrics.min_width_m < thresholds["min_width_m"]:
+        stats.inc_reason("min_width_m")
+        return False
+    return True
 
 
-def orientation_from_tags(tags: Dict[str, Any]) -> Tuple[Optional[float], str]:
-    if "roof:direction" in tags:
-        try:
-            return float(tags["roof:direction"]) % 360, "high"
-        except ValueError:
-            return None, "none"
-    if "roof:orientation" in tags:
-        value = str(tags["roof:orientation"]).upper()
-        if value in ORIENTATION_MAP:
-            return ORIENTATION_MAP[value], "high"
-    return None, "none"
+def matches_target(tags: Dict[str, Any], target: str) -> bool:
+    building = tags.get("building") or ""
+    if target == "mixed":
+        return True
+    if target == "industrial":
+        return building in {"industrial", "warehouse"}
+    if target == "commercial":
+        return building in {"commercial", "retail", "supermarket", "office"}
+    return True
 
 
-def estimate_orientation(geom: Polygon) -> Optional[float]:
-    min_rect = geom.minimum_rotated_rectangle
-    coords = list(min_rect.exterior.coords)
-    if len(coords) < 4:
-        return None
-    p1, p2 = coords[0], coords[1]
-    p3 = coords[1]
-    p4 = coords[2]
-    d1 = math.dist(p1, p2)
-    d2 = math.dist(p3, p4)
-    if d1 >= d2:
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-    else:
-        dx = p4[0] - p3[0]
-        dy = p4[1] - p3[1]
-    if dx == 0 and dy == 0:
-        return None
-    angle = (math.degrees(math.atan2(dx, dy)) + 360) % 360
-    return angle
-
-
-def orientation_score(orientation: Optional[float], confidence: str) -> float:
-    if orientation is None:
-        return 0.0
-    north = (orientation >= 315 or orientation <= 45)
-    south = 135 <= orientation <= 225
-    if confidence == "high":
-        if north:
-            return 10.0
-        if south:
-            return -6.0
-        return 0.0
-    if confidence == "low":
-        if north:
-            return 5.0
-        if south:
-            return -3.0
-    return 0.0
-
-
-def geometry_score(metrics: Dict[str, float]) -> float:
-    comp = min(metrics["compactness"] / 0.3, 1.0)
-    conv = min(metrics["convexity"] / 0.9, 1.0)
-    rect = min(metrics["rectangularity"] / 0.9, 1.0)
-    aspect = 1.0 - min(max(metrics["aspect_ratio"] - 2, 0) / 6, 1.0)
-    holes = 1.0 - min(metrics["hole_area_ratio"] / 0.2, 1.0)
-    score = np.mean([comp, conv, rect, aspect, holes])
-    return float(score * 45)
-
-
-def area_score(area: float, min_area: float = 300, max_area: float = 2000) -> float:
-    if area <= min_area:
-        return 0.0
-    if area >= max_area:
-        return 40.0
-    return (area - min_area) / (max_area - min_area) * 40
-
-
-def tag_confidence_score(tags: Dict[str, Any]) -> float:
-    if any(k in tags for k in {"roof:shape", "roof:direction", "roof:orientation", "roof:material"}):
-        return 5.0
-    if tags.get("building") in PRIORITY_BUILDINGS:
-        return 3.0
-    return 0.0
-
-
-def compute_score(metrics: Dict[str, float], tags: Dict[str, Any], orientation: Optional[float], confidence: str) -> float:
-    score = area_score(metrics["area_m2"]) + geometry_score(metrics) + orientation_score(orientation, confidence)
-    score += tag_confidence_score(tags)
-    building = str(tags.get("building", "")).lower()
-    if building in RESIDENTIAL_BUILDINGS and metrics["area_m2"] < 600:
-        score -= 15.0
-    return max(0.0, min(100.0, score))
-
-
-def deduplicate_candidates(candidates: List[Candidate]) -> List[Candidate]:
+def deduplicate(candidates: List[Candidate], stats: Stats) -> List[Candidate]:
     if not candidates:
         return []
-    geoms = [c.geometry for c in candidates]
-    tree = STRtree(geoms)
-    to_remove = set()
-    for idx, cand in enumerate(candidates):
-        if idx in to_remove:
-            continue
-        matches = tree.query(cand.geometry)
-        for geom in matches:
-            jdx = geoms.index(geom)
-            if jdx == idx or jdx in to_remove:
-                continue
-            other = candidates[jdx]
-            inter = cand.geometry.intersection(other.geometry)
+    candidates_sorted = sorted(candidates, key=lambda c: c.score, reverse=True)
+    kept: List[Candidate] = []
+    for candidate in candidates_sorted:
+        duplicate = False
+        for kept_candidate in kept:
+            inter = candidate.geometry.intersection(kept_candidate.geometry)
             if inter.is_empty:
                 continue
-            union_area = cand.geometry.union(other.geometry).area
-            if union_area == 0:
-                continue
-            iou = inter.area / union_area
+            union = candidate.geometry.union(kept_candidate.geometry)
+            iou = inter.area / union.area if union.area else 0.0
             if iou > 0.9:
-                if other.score > cand.score:
-                    to_remove.add(idx)
-                else:
-                    to_remove.add(jdx)
-    return [c for idx, c in enumerate(candidates) if idx not in to_remove]
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(candidate)
+        else:
+            stats.dedup_removed += 1
+
+    resolved: List[Candidate] = []
+    for candidate in kept:
+        if candidate.tags.get("building:part"):
+            resolved.append(candidate)
+            continue
+        overlap_parts = [
+            other
+            for other in kept
+            if other.tags.get("building:part")
+            and other.geometry.intersects(candidate.geometry)
+        ]
+        prefer_part = False
+        for other in overlap_parts:
+            inter = other.geometry.intersection(candidate.geometry)
+            union = other.geometry.union(candidate.geometry)
+            iou = inter.area / union.area if union.area else 0.0
+            if iou > 0.8 and any(k.startswith("roof:") for k in other.tags):
+                prefer_part = True
+                break
+        if prefer_part:
+            stats.dedup_removed += 1
+        else:
+            resolved.append(candidate)
+    return resolved
 
 
-def prefer_building_parts(candidates: List[Candidate]) -> List[Candidate]:
-    parts = [c for c in candidates if "building:part" in c.tags]
-    buildings = [c for c in candidates if "building:part" not in c.tags]
-    if not parts or not buildings:
-        return candidates
-    to_remove = set()
-    building_geoms = [c.geometry for c in buildings]
-    tree = STRtree(building_geoms)
-    for part in parts:
-        for geom in tree.query(part.geometry):
-            idx = building_geoms.index(geom)
-            building = buildings[idx]
-            inter = part.geometry.intersection(building.geometry)
-            if inter.is_empty:
-                continue
-            iou = inter.area / building.geometry.area if building.geometry.area else 0
-            if iou > 0.8 and any(k.startswith("roof:") for k in part.tags):
-                to_remove.add(building.osm_id)
-    return [c for c in candidates if c.osm_id not in to_remove]
+def to_feature(candidate: Candidate) -> Dict[str, Any]:
+    return {
+        "type": "Feature",
+        "geometry": geom.mapping(candidate.geometry),
+        "properties": {
+            "osm_id": candidate.osm_id,
+            "osm_type": candidate.osm_type,
+            "building": candidate.tags.get("building"),
+            "area_m2": round(candidate.metrics.area_m2, 2),
+            "score": round(candidate.score, 2),
+            "rectangularity": round(candidate.metrics.rectangularity, 3),
+            "convexity": round(candidate.metrics.convexity, 3),
+            "compactness": round(candidate.metrics.compactness, 3),
+            "aspect_ratio": round(candidate.metrics.aspect_ratio, 3),
+            "orientation_deg": round(candidate.orientation_deg, 1) if candidate.orientation_deg else None,
+            "orientation_confidence": candidate.orientation_confidence,
+            "solar_status": candidate.solar_status,
+            "centroid_lat": round(candidate.centroid_lat, 6),
+            "centroid_lon": round(candidate.centroid_lon, 6),
+            "tags_relevantes": candidate.tags,
+        },
+    }
 
 
-def process_tile(
-    tile: Polygon,
-    cache_dir: Path,
-    rate_limiter: RateLimiter,
-    timeout_s: int,
-    min_area_m2: float,
-    strict: bool,
-    stats: Counter,
-) -> List[Candidate]:
-    query = build_query(tile, timeout_s)
-    data = query_overpass(query, cache_dir, rate_limiter, timeout_s)
-    elements = collect_elements(data)
-    candidates: List[Candidate] = []
-    for osm_id, osm_type, tags, geom in elements:
-        if has_solar_tags(tags):
-            stats["excluded_solar"] += 1
-            continue
-        if not is_building_candidate(tags):
-            stats["excluded_building"] += 1
-            continue
-        metrics = compute_metrics(geom)
-        if metrics is None:
-            stats["invalid_geometry"] += 1
-            continue
-        reason = filter_geometry(metrics, min_area_m2, strict)
-        if reason:
-            stats[f"filtered_{reason}"] += 1
-            continue
-        orientation, confidence = orientation_from_tags(tags)
-        if orientation is None:
-            orientation = estimate_orientation(geom)
-            confidence = "low" if orientation is not None else "none"
-        score = compute_score(metrics, tags, orientation, confidence)
-        solar_status = "unknown"
-        candidate = Candidate(
-            osm_id=osm_id,
-            osm_type=osm_type,
-            geometry=geom,
-            tags=tags_subset(tags),
-            area_m2=metrics["area_m2"],
-            perimeter_m=metrics["perimeter_m"],
-            compactness=metrics["compactness"],
-            convexity=metrics["convexity"],
-            rectangularity=metrics["rectangularity"],
-            aspect_ratio=metrics["aspect_ratio"],
-            vertex_count=metrics["vertex_count"],
-            hole_area_ratio=metrics["hole_area_ratio"],
-            min_width_m=metrics["min_width_m"],
-            orientation_deg=orientation,
-            orientation_confidence=confidence,
-            solar_status=solar_status,
-            centroid_lat=metrics["centroid_lat"],
-            centroid_lon=metrics["centroid_lon"],
-            score=score,
+def export_outputs(candidates: List[Candidate], config: Config) -> None:
+    os.makedirs(config.out_dir, exist_ok=True)
+    features = [to_feature(candidate) for candidate in candidates]
+    geojson = {"type": "FeatureCollection", "features": features}
+    geojson_path = os.path.join(config.out_dir, "candidates.geojson")
+    with open(geojson_path, "w", encoding="utf-8") as handle:
+        json.dump(geojson, handle)
+
+    csv_path = os.path.join(config.out_dir, "candidates.csv")
+    with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "osm_id",
+                "osm_type",
+                "building",
+                "area_m2",
+                "score",
+                "rectangularity",
+                "convexity",
+                "compactness",
+                "aspect_ratio",
+                "orientation_deg",
+                "orientation_confidence",
+                "solar_status",
+                "centroid_lat",
+                "centroid_lon",
+                "tags_relevantes",
+            ],
         )
-        candidates.append(candidate)
-        stats["candidates_kept"] += 1
-    return candidates
-
-
-def generate_report(
-    out_dir: Path,
-    args: argparse.Namespace,
-    stats: Counter,
-    timings: Dict[str, float],
-    failures: List[str],
-    top_candidates: List[Candidate],
-) -> None:
-    report_path = out_dir / "report.md"
-    with report_path.open("w", encoding="utf-8") as f:
-        f.write(f"# Report ({datetime.utcnow().isoformat()}Z)\n\n")
-        f.write("## Parameters\n")
-        for key, value in vars(args).items():
-            f.write(f"- **{key}**: {value}\n")
-        f.write("\n## Counts\n")
-        total_removed = sum(v for k, v in stats.items() if k.startswith("filtered_") or k.startswith("excluded_"))
-        total_kept = stats.get("candidates_kept", 0)
-        total = total_removed + total_kept
-        f.write(f"- Total processed: {total}\n")
-        for key, value in stats.most_common():
-            percent = (value / total * 100) if total else 0
-            f.write(f"- {key}: {value} ({percent:.1f}%)\n")
-        f.write("\n## Timings\n")
-        for key, value in timings.items():
-            f.write(f"- {key}: {value:.2f}s\n")
-        if failures:
-            f.write("\n## Tile Failures\n")
-            for failure in failures:
-                f.write(f"- {failure}\n")
-        f.write("\n## Top 50\n")
-        f.write("| osm_id | score | area_m2 | building | orientation |\n")
-        f.write("| --- | --- | --- | --- | --- |\n")
-        for cand in top_candidates[:50]:
-            building = cand.tags.get("building") or cand.tags.get("building:part") or ""
-            f.write(
-                f"| {cand.osm_id} | {cand.score:.1f} | {cand.area_m2:.1f} | {building} | {cand.orientation_deg if cand.orientation_deg is not None else ''} |\n"
+        writer.writeheader()
+        for candidate in candidates:
+            writer.writerow(
+                {
+                    "osm_id": candidate.osm_id,
+                    "osm_type": candidate.osm_type,
+                    "building": candidate.tags.get("building"),
+                    "area_m2": round(candidate.metrics.area_m2, 2),
+                    "score": round(candidate.score, 2),
+                    "rectangularity": round(candidate.metrics.rectangularity, 3),
+                    "convexity": round(candidate.metrics.convexity, 3),
+                    "compactness": round(candidate.metrics.compactness, 3),
+                    "aspect_ratio": round(candidate.metrics.aspect_ratio, 3),
+                    "orientation_deg": round(candidate.orientation_deg, 1) if candidate.orientation_deg else None,
+                    "orientation_confidence": candidate.orientation_confidence,
+                    "solar_status": candidate.solar_status,
+                    "centroid_lat": round(candidate.centroid_lat, 6),
+                    "centroid_lon": round(candidate.centroid_lon, 6),
+                    "tags_relevantes": json.dumps(candidate.tags, ensure_ascii=False),
+                }
             )
 
 
-def export_outputs(out_dir: Path, candidates: List[Candidate]) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    records = []
-    for cand in candidates:
-        records.append(
-            {
-                "osm_id": cand.osm_id,
-                "osm_type": cand.osm_type,
-                "building": cand.tags.get("building") or cand.tags.get("building:part"),
-                "area_m2": cand.area_m2,
-                "score": cand.score,
-                "rectangularity": cand.rectangularity,
-                "convexity": cand.convexity,
-                "compactness": cand.compactness,
-                "aspect_ratio": cand.aspect_ratio,
-                "orientation_deg": cand.orientation_deg,
-                "orientation_confidence": cand.orientation_confidence,
-                "solar_status": cand.solar_status,
-                "centroid_lat": cand.centroid_lat,
-                "centroid_lon": cand.centroid_lon,
-                "tags_relevantes": json.dumps(cand.tags, ensure_ascii=False),
-                "geometry": cand.geometry,
-            }
+def write_report(
+    candidates: List[Candidate],
+    config: Config,
+    stats: Stats,
+    failed_tiles: List[Tuple[float, float, float, float]],
+) -> None:
+    total_time = time.time() - stats.start_time
+    total_elements = max(stats.total_elements, 1)
+
+    def fmt_count(value: int) -> str:
+        pct = (value / total_elements) * 100
+        return f"{value} ({pct:.2f}%)"
+
+    report_path = os.path.join(config.out_dir, "report.md")
+    with open(report_path, "w", encoding="utf-8") as handle:
+        handle.write("# Roof Candidate Report\n\n")
+        handle.write("## Parameters\n")
+        handle.write("```\n")
+        handle.write(json.dumps(config.__dict__, indent=2, ensure_ascii=False))
+        handle.write("\n```\n\n")
+        handle.write("## Summary\n")
+        handle.write(f"Total elements fetched: {stats.total_elements}\n\n")
+        handle.write(f"Tiles fetched: {stats.fetched_tiles}\n\n")
+        handle.write(f"Tiles failed: {stats.failed_tiles}\n\n")
+        handle.write(f"Discarded invalid geometry: {fmt_count(stats.discarded_invalid)}\n\n")
+        handle.write(f"Discarded solar tags: {fmt_count(stats.discarded_solar)}\n\n")
+        handle.write(
+            f"Discarded excluded building: {fmt_count(stats.discarded_excluded_building)}\n\n"
         )
-    gdf = gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
-    gdf.to_file(out_dir / "candidates.geojson", driver="GeoJSON")
-    df = pd.DataFrame(records).drop(columns=["geometry"])
-    df.to_csv(out_dir / "candidates.csv", index=False)
+        handle.write(f"Discarded target mismatch: {fmt_count(stats.discarded_target)}\n\n")
+        handle.write(f"Deduplicated removed: {fmt_count(stats.dedup_removed)}\n\n")
+        handle.write("### Geometry filter removals\n")
+        for reason, count in stats.discarded_geometry_filter.items():
+            handle.write(f"- {reason}: {fmt_count(count)}\n")
+        handle.write("\n")
+        handle.write("## Timing\n")
+        for stage, duration in stats.stage_times.items():
+            handle.write(f"- {stage}: {duration:.2f}s\n")
+        handle.write(f"- total: {total_time:.2f}s\n\n")
+
+        if failed_tiles:
+            handle.write("## Failed tiles\n")
+            for tile in failed_tiles:
+                handle.write(f"- {tile}\n")
+            handle.write("\n")
+
+        handle.write("## Top 50 candidates\n")
+        handle.write("| osm_id | score | area_m2 | building | orientation |\n")
+        handle.write("| --- | --- | --- | --- | --- |\n")
+        for candidate in candidates[:50]:
+            orientation = (
+                f"{candidate.orientation_deg:.1f} ({candidate.orientation_confidence})"
+                if candidate.orientation_deg is not None
+                else "None"
+            )
+            handle.write(
+                f"| {candidate.osm_id} | {candidate.score:.2f} | {candidate.metrics.area_m2:.1f} | "
+                f"{candidate.tags.get('building')} | {orientation} |\n"
+            )
+
+
+def process_elements(
+    elements: List[Dict[str, Any]],
+    aoi_polygon: geom.base.BaseGeometry,
+    config: Config,
+    stats: Stats,
+) -> List[Candidate]:
+    candidates: List[Candidate] = []
+    for element in elements:
+        stats.total_elements += 1
+        tags = element.get("tags", {})
+        if has_solar(tags):
+            stats.discarded_solar += 1
+            continue
+        building = tags.get("building")
+        if building and building in EXCLUDED_BUILDINGS:
+            stats.discarded_excluded_building += 1
+            continue
+        if not matches_target(tags, config.target):
+            stats.discarded_target += 1
+            continue
+
+        geometry = element_to_geometry(element)
+        if geometry is None or geometry.is_empty:
+            stats.discarded_invalid += 1
+            continue
+        if not geometry.intersects(aoi_polygon):
+            continue
+        metrics = compute_metrics(geometry)
+        if not metrics:
+            stats.discarded_invalid += 1
+            continue
+        if not filter_metrics(metrics, config, stats):
+            continue
+
+        tags_relevant = sanitize_tags(tags)
+        orientation_deg, orientation_confidence = orientation_from_tags(tags_relevant)
+        if orientation_deg is None:
+            estimated = orientation_from_geometry(geometry)
+            if estimated is not None:
+                orientation_deg = estimated
+                orientation_confidence = "low"
+
+        area_component = area_score(metrics.area_m2)
+        geometry_component = geometry_score(metrics)
+        orientation_component = orientation_score(orientation_deg, orientation_confidence)
+        tag_component = tag_confidence_score(tags_relevant)
+        score = area_component + geometry_component + orientation_component + tag_component
+
+        if building in RESIDENTIAL_BUILDINGS and metrics.area_m2 < 600:
+            score -= 15
+
+        centroid = geometry.centroid
+        candidate = Candidate(
+            osm_id=f"{element.get('type')}:{element.get('id')}",
+            osm_type=element.get("type"),
+            geometry=geometry,
+            tags=tags_relevant,
+            metrics=metrics,
+            orientation_deg=orientation_deg,
+            orientation_confidence=orientation_confidence,
+            score=score,
+            solar_status="unknown",
+            centroid_lon=centroid.x,
+            centroid_lat=centroid.y,
+        )
+        candidates.append(candidate)
+    return candidates
 
 
 def main() -> None:
-    args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    config = parse_args()
+    random.seed(config.seed)
 
-    start_time = time.time()
-    aoi = load_aoi_geometry(args)
-    tile_size = adapt_tile_size(aoi, args.tile_size_deg)
-    tiles = build_tiles(aoi, tile_size)
-    logging.info("Using %s tiles with size %.4f deg", len(tiles), tile_size)
+    aoi_polygon, bounds = load_aoi(config)
 
-    rate_limiter = RateLimiter(min_interval_s=1.0)
-    stats: Counter = Counter()
-    failures: List[str] = []
-    cache_dir = Path(args.cache_dir)
+    if config.tile_size_deg <= 0:
+        raise SystemExit("tile_size_deg must be > 0")
 
-    tile_start = time.time()
-    candidates: List[Candidate] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+    tile_size = config.tile_size_deg
+    tiles = tile_bounds(bounds, tile_size)
+    if len(tiles) > 8000:
+        scale = math.sqrt(len(tiles) / 8000)
+        tile_size = round(tile_size * scale, 5)
+        tiles = tile_bounds(bounds, tile_size)
+        logging.warning(
+            "Large tile count detected (%s). Adjusting tile_size_deg to %s.",
+            len(tiles),
+            tile_size,
+        )
+    elif len(tiles) > 5000:
+        logging.warning("Large tile count detected: %s", len(tiles))
+
+    client = OverpassClient(config.timeout_s, config.cache_dir, RateLimiter())
+
+    stats = Stats()
+    tile_results: List[TileResult] = []
+    failed_tiles: List[Tuple[float, float, float, float]] = []
+
+    start = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=config.workers) as executor:
         futures = {
-            executor.submit(
-                process_tile,
-                tile,
-                cache_dir,
-                rate_limiter,
-                args.timeout_s,
-                args.min_area_m2,
-                args.strict,
-                stats,
-            ): tile
-            for tile in tiles
+            executor.submit(fetch_tile, client, tile, config.timeout_s): tile for tile in tiles
         }
         for future in concurrent.futures.as_completed(futures):
             tile = futures[future]
-            try:
-                candidates.extend(future.result())
-            except Exception as exc:  # noqa: BLE001
-                logging.warning("Tile failed %s: %s", tile.bounds, exc)
-                failures.append(str(tile.bounds))
-    tile_time = time.time() - tile_start
+            result = future.result()
+            tile_results.append(result)
+            stats.fetched_tiles += 1
+            if result.failed:
+                stats.failed_tiles += 1
+                failed_tiles.append(tile)
+                logging.warning("Tile failed %s: %s", tile, result.error)
+    stats.stage_times["fetch_tiles"] = time.time() - start
 
-    dedup_start = time.time()
-    candidates = prefer_building_parts(candidates)
-    candidates = deduplicate_candidates(candidates)
-    dedup_time = time.time() - dedup_start
+    all_elements = [element for result in tile_results for element in result.elements]
+    if not all_elements:
+        logging.warning("No elements fetched from Overpass")
 
-    candidates.sort(key=lambda c: c.score, reverse=True)
-    candidates = candidates[: args.max_candidates]
+    start = time.time()
+    candidates = process_elements(all_elements, aoi_polygon, config, stats)
+    stats.stage_times["process_elements"] = time.time() - start
 
-    export_start = time.time()
-    out_dir = Path(args.out_dir)
-    export_outputs(out_dir, candidates)
-    export_time = time.time() - export_start
+    start = time.time()
+    candidates = deduplicate(candidates, stats)
+    stats.stage_times["deduplicate"] = time.time() - start
 
-    timings = {
-        "total": time.time() - start_time,
-        "tiles": tile_time,
-        "dedup": dedup_time,
-        "export": export_time,
-    }
-    generate_report(out_dir, args, stats, timings, failures, candidates)
+    candidates = sorted(candidates, key=lambda c: c.score, reverse=True)[: config.max_candidates]
+
+    export_outputs(candidates, config)
+    write_report(candidates, config, stats, failed_tiles)
+    logging.info("Generated %s candidates", len(candidates))
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:  # noqa: BLE001
-        logging.error("Fatal error: %s", exc)
-        sys.exit(1)
+    main()
