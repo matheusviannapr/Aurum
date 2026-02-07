@@ -1,9 +1,8 @@
-streamlit
-pandas
 requests
+httpx
+pandas
 shapely
 pyproj
-folium
-streamlit-folium
-python-dotenv
-psycopg2-binary
+geopandas
+rtree
+pytest
