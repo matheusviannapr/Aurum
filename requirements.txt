@@ -6,3 +6,8 @@ pyproj
 geopandas
 rtree
 pytest
+streamlit
+folium
+streamlit-folium
+python-dotenv
+psycopg2-binary
