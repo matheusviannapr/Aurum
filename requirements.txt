@@ -7,7 +7,7 @@ pyproj
 geopandas
 rtree
 pytest
-streamlit
+streamlit>=1.41.0
 folium
 streamlit-folium
 python-dotenv
