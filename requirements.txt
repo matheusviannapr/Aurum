@@ -8,6 +8,7 @@ geopandas
 rtree
 pytest
 streamlit
+altair<5
 folium
 streamlit-folium
 python-dotenv
